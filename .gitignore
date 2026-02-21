@@ -1,0 +1,17 @@
+**/.DS_Store
+**/.ipynb_checkpoints
+**/venv
+**/.python-version
+**/desktop.ini
+**.lnk
+
+# Ignore fork-syncing workflow, should only exist in forks
+# cf. https://github.com/Giom-V/gemini-api-cookbook/blob/main/.github/workflows/sync.yml
+.github/workflows/sync.yml
+
+# Ignore Python scripts created at root level by antigravity
+/*.py
+
+# Critical security: prevent credential JSON files from being committed
+*.json
+snark-shot-5f3a4ada1b7c.json
