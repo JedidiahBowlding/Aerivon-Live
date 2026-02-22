@@ -4,8 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Aerivon Live – Mic WS Client</title>
+    <link rel="icon" href="./assets/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="./assets/favicon-96x96.png" sizes="96x96" />
+    <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
+    <link rel="manifest" href="./assets/site.webmanifest" />
     <style>
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+      .logo { width: 36px; height: 36px; border-radius: 8px; }
       .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
       button { padding: 10px 14px; }
       #status { font-weight: 600; }
@@ -18,7 +24,10 @@
     </style>
   </head>
   <body>
-    <h1>Aerivon Live – WebSocket Microphone Client</h1>
+    <div class="header">
+      <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
+      <h1 style="margin: 0">Aerivon Live – WebSocket Microphone Client</h1>
+    </div>
 
     <div class="row">
       <button id="startBtn">🎤 Start</button>
