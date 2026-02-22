@@ -19,3 +19,12 @@
 # Critical security: prevent credential JSON files from being committed
 *.json
 snark-shot-5f3a4ada1b7c.json
+
+# Environment files (may contain API keys)
+.env
+.env.*
+*.DS_Store
+*.venv/
+node_modules/
+dist/
+.pytest_cache/

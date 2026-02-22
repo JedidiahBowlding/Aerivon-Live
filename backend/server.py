@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import os
 import re
 import time
+import hashlib
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from google import genai
+from google.genai import types
+from google.genai.types import HttpOptions
+from google.cloud import storage
+
+from playwright.async_api import async_playwright
+
 from agent import AerivonLiveAgent
-from gemini_client import check_live_model_availability
+from gemini_client import check_live_model_availability, resolve_fallback_model
 
 
 app = FastAPI(title="Aerivon Live Agent API")
@@ -23,6 +34,21 @@ MAX_MESSAGE_LENGTH = 4000
 MAX_SESSION_RESULTS = 100
 RATE_LIMIT_SECONDS = 1.0
 MAX_RESULT_SIZE = 20000
+MAX_WS_MESSAGE_BYTES = 256 * 1024
+DEFAULT_LIVE_AUDIO_SAMPLE_RATE = int(os.getenv("AERIVON_LIVE_AUDIO_SAMPLE_RATE", "24000"))
+
+# Live generation tuning. Live sessions can default to relatively small output budgets unless specified.
+# Bump the default so audio replies are less likely to stop mid-sentence.
+AERIVON_LIVE_MAX_OUTPUT_TOKENS = int(os.getenv("AERIVON_LIVE_MAX_OUTPUT_TOKENS", "2048"))
+AERIVON_LIVE_TEMPERATURE = float(os.getenv("AERIVON_LIVE_TEMPERATURE", "0.7"))
+
+# Persistent memory (optional): store one JSON per user in GCS.
+AERIVON_MEMORY_BUCKET = os.getenv("AERIVON_MEMORY_BUCKET", "").strip()
+AERIVON_MEMORY_PREFIX = os.getenv("AERIVON_MEMORY_PREFIX", "memory/").strip() or "memory/"
+AERIVON_MEMORY_MAX_EXCHANGES = int(os.getenv("AERIVON_MEMORY_MAX_EXCHANGES", "6"))
+
+UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
+UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-2.0-flash").strip()
 INJECTION_PATTERNS = (
     "ignore previous instructions",
     "reveal system prompt",
@@ -49,6 +75,114 @@ def _get_agent() -> AerivonLiveAgent:
     return agent
 
 
+def _sanitize_user_id(raw: str | None) -> str:
+    raw = (raw or "").strip()
+    if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", raw or ""):
+        return raw
+    if not raw:
+        return "default"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _memory_blob_name(user_id: str) -> str:
+    prefix = AERIVON_MEMORY_PREFIX
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return f"{prefix}{user_id}.json"
+
+
+async def _load_user_memory(*, user_id: str) -> dict[str, Any] | None:
+    if not AERIVON_MEMORY_BUCKET:
+        return None
+
+    blob_name = _memory_blob_name(user_id)
+
+    def _load() -> dict[str, Any] | None:
+        client = storage.Client()
+        bucket = client.bucket(AERIVON_MEMORY_BUCKET)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return None
+        text = blob.download_as_text(encoding="utf-8")
+        data = json.loads(text) if text else {}
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    try:
+        return await asyncio.to_thread(_load)
+    except Exception:
+        return None
+
+
+async def _save_user_memory(*, user_id: str, memory: dict[str, Any]) -> None:
+    if not AERIVON_MEMORY_BUCKET:
+        return
+
+    blob_name = _memory_blob_name(user_id)
+
+    def _save() -> None:
+        client = storage.Client()
+        bucket = client.bucket(AERIVON_MEMORY_BUCKET)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(
+            json.dumps(memory, ensure_ascii=False, indent=2),
+            content_type="application/json",
+        )
+
+    try:
+        await asyncio.to_thread(_save)
+    except Exception:
+        # Best-effort only.
+        return
+
+
+def _memory_to_prompt(memory: dict[str, Any] | None) -> str:
+    if not memory or not isinstance(memory, dict):
+        return ""
+    exchanges = memory.get("exchanges")
+    if not isinstance(exchanges, list) or not exchanges:
+        return ""
+
+    # Keep it short: last few exchanges only.
+    lines: list[str] = []
+    lines.append("Persistent user memory (from previous sessions):")
+    summary = memory.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"Summary: {summary.strip()}")
+
+    lines.append("Recent context:")
+    for ex in exchanges[-AERIVON_MEMORY_MAX_EXCHANGES:]:
+        if not isinstance(ex, dict):
+            continue
+        u = str(ex.get("user") or "").strip()
+        m = str(ex.get("model") or "").strip()
+        if u:
+            lines.append(f"- User: {u[:400]}")
+        if m:
+            lines.append(f"- Model: {m[:600]}")
+
+    return "\n".join(lines).strip()
+
+
+async def _check_live_model_availability_fast(project: str | None, location: str) -> dict[str, Any]:
+    """Bound the Live availability probe so endpoints don't hang.
+
+    Some environments/network paths can cause models.list() to stall.
+    This helper runs the synchronous probe in a thread and applies a short timeout.
+    """
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(check_live_model_availability, project, location),
+            timeout=3.0,
+        )
+    except asyncio.TimeoutError:
+        return {"live_models_available": False, "error": "probe_timeout"}
+    except Exception as exc:
+        return {"live_models_available": False, "error": str(exc)}
+
+
 def _contains_unsafe_target(message: str) -> bool:
     lowered = message.lower()
     if any(host in lowered for host in BLOCKED_HOST_PATTERNS):
@@ -63,6 +197,297 @@ def _contains_unsafe_target(message: str) -> bool:
         if host in BLOCKED_HOST_PATTERNS:
             return True
     return False
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Best-effort parse of a JSON object from model text."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty response")
+
+    # Strip markdown fences.
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", text)
+        text = re.sub(r"\n```$", "", text).strip()
+
+    # Fast path.
+    if text.startswith("{") and text.endswith("}"):
+        return json.loads(text)
+
+    # Scan for first balanced {...}.
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no json object found")
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : i + 1])
+    raise ValueError("unterminated json object")
+
+
+def _ui_action_prompt(task: str, memory: list[str]) -> str:
+    allowed = [
+        "goto (url)",
+        "click (x,y)",
+        "type (text)",
+        "press (key)",
+        "scroll (delta_y)",
+        "wait (ms)",
+    ]
+    context = "\n".join(memory[-12:]).strip()
+
+    return (
+        "You are Aerivon UI Navigator.\n"
+        "You DO have access to the current screen via screenshots provided to you each step, "
+        "and you DO have an execution layer that will run your JSON actions in a real browser (Playwright).\n"
+        "Never say you can't browse, can't take screenshots, or that you're just a language model.\n"
+        "If you need a different view, output actions like scroll/wait/click/goto to obtain it.\n\n"
+        "Return ONLY valid JSON (no markdown) matching this schema:\n"
+        "{\n"
+        "  \"actions\": [\n"
+        "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
+        "    {\"type\": \"click\", \"x\": 0, \"y\": 0} |\n"
+        "    {\"type\": \"type\", \"text\": \"...\"} |\n"
+        "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
+        "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
+        "    {\"type\": \"wait\", \"ms\": 1000}\n"
+        "  ],\n"
+        "  \"done\": true|false,\n"
+        "  \"note\": \"short explanation\"\n"
+        "}\n\n"
+        f"Allowed action types: {', '.join(allowed)}.\n"
+        "Rules: use click x/y based on visible UI; do not invent URLs; do not access localhost/private IPs/metadata.\n"
+        "If the target element isn't visible, prefer scroll then another step.\n\n"
+        "Context (what has happened so far):\n"
+        f"{context}\n\n"
+        f"User intent (do not change this goal): {task}\n"
+    )
+
+
+async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task: str, memory: list[str]) -> dict[str, Any]:
+    cfg = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=1024,
+        response_mime_type="application/json",
+    )
+
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text=_ui_action_prompt(task, memory)),
+                types.Part.from_bytes(data=screenshot_png, mime_type="image/png"),
+            ],
+        )
+    ]
+
+    resp = client.models.generate_content(model=UI_MODEL, contents=contents, config=cfg)
+    parts = resp.candidates[0].content.parts if resp.candidates else []
+    text = "".join([p.text for p in parts if getattr(p, "text", None)])
+    return _extract_json_object(text)
+
+
+async def _ui_screenshot_b64(page) -> tuple[str, bytes]:
+    png = await page.screenshot(full_page=True, type="png")
+    return base64.b64encode(png).decode("ascii"), png
+
+
+@app.websocket("/ws/ui")
+async def ws_ui(websocket: WebSocket) -> None:
+    """UI Navigator WS: Gemini multimodal plans JSON actions, backend executes via Playwright."""
+
+    await websocket.accept()
+
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not use_vertex or not project:
+        await websocket.send_json({"type": "error", "error": "Vertex not enabled"})
+        await websocket.close(code=1011)
+        return
+
+    gen_client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+
+    session_id = int(time.time())
+    await websocket.send_json({"type": "status", "status": "connected", "session_id": session_id, "model": UI_MODEL})
+
+    cancel_flag = False
+    memory: list[str] = []
+    current_task: str | None = None
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={"width": 1366, "height": 2200})
+        page = await context.new_page()
+
+        async def send(payload: dict[str, Any]) -> None:
+            payload.setdefault("session_id", session_id)
+            await websocket.send_json(payload)
+
+        async def safe_goto(url: str) -> None:
+            from tools import is_safe_url
+
+            if not is_safe_url(url):
+                raise ValueError("Blocked unsafe URL")
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(800)
+
+        async def execute_action(action: dict[str, Any]) -> dict[str, Any]:
+            nonlocal cancel_flag
+            if cancel_flag:
+                return {"ok": False, "skipped": True, "reason": "cancelled"}
+
+            t = str(action.get("type") or "").strip().lower()
+            if t == "goto":
+                url = str(action.get("url") or "")
+                await safe_goto(url)
+                return {"ok": True, "type": "goto", "url": url}
+            if t == "click":
+                x = int(action.get("x"))
+                y = int(action.get("y"))
+                await page.mouse.click(x, y)
+                await page.wait_for_timeout(500)
+                return {"ok": True, "type": "click", "x": x, "y": y}
+            if t == "type":
+                text = str(action.get("text") or "")
+                await page.keyboard.type(text)
+                return {"ok": True, "type": "type", "text": text}
+            if t == "press":
+                key = str(action.get("key") or "Enter")
+                await page.keyboard.press(key)
+                await page.wait_for_timeout(600)
+                return {"ok": True, "type": "press", "key": key}
+            if t == "scroll":
+                dy = int(action.get("delta_y") or 0)
+                await page.mouse.wheel(0, dy)
+                await page.wait_for_timeout(300)
+                return {"ok": True, "type": "scroll", "delta_y": dy}
+            if t == "wait":
+                ms = int(action.get("ms") or 0)
+                await page.wait_for_timeout(max(0, ms))
+                return {"ok": True, "type": "wait", "ms": ms}
+
+            return {"ok": False, "error": f"unknown action type: {t}"}
+
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if not isinstance(msg, dict):
+                    continue
+
+                msg_type = str(msg.get("type") or "").strip().lower()
+
+                if msg_type == "interrupt":
+                    cancel_flag = True
+                    await send({"type": "interrupted", "source": "client"})
+                    continue
+
+                if msg_type == "open":
+                    cancel_flag = False
+                    # Starting a new navigation flow resets intent/memory.
+                    memory.clear()
+                    current_task = None
+                    url = str(msg.get("url") or "")
+                    await send({"type": "status", "status": "navigating", "url": url})
+                    await safe_goto(url)
+                    try:
+                        title = await page.title()
+                    except Exception:
+                        title = ""
+                    memory.append(f"Opened URL: {page.url} Title: {title}")
+                    b64, _png = await _ui_screenshot_b64(page)
+                    await send({"type": "screenshot", "mime_type": "image/png", "data_b64": b64, "url": page.url})
+                    await send({"type": "status", "status": "ready", "url": page.url})
+                    continue
+
+                if msg_type == "task":
+                    cancel_flag = False
+                    task = str(msg.get("text") or "")
+                    if not task:
+                        await send({"type": "error", "error": "missing text"})
+                        continue
+
+                    # Persist the original intent across steps.
+                    if current_task is None:
+                        current_task = task
+                        memory.append(f"User intent: {current_task}")
+                    else:
+                        # Treat subsequent task messages as clarifications.
+                        memory.append(f"User clarification: {task}")
+
+                    task = current_task
+
+                    # Prevent planning against an empty page.
+                    if (page.url or "").startswith("about:blank"):
+                        await send({"type": "error", "error": "No page loaded yet. Click Open URL first."})
+                        continue
+
+                    await send({"type": "status", "status": "planning", "task": task})
+
+                    for step in range(UI_MAX_STEPS):
+                        if cancel_flag:
+                            await send({"type": "status", "status": "cancelled"})
+                            break
+
+                        b64, png = await _ui_screenshot_b64(page)
+                        try:
+                            title = await page.title()
+                        except Exception:
+                            title = ""
+                        memory.append(f"Step {step+1} URL: {page.url} Title: {title}")
+
+                        plan = await _ui_plan_actions(client=gen_client, screenshot_png=png, task=task, memory=memory)
+                        await send({"type": "actions", "step": step + 1, "plan": plan})
+
+                        memory.append(f"Planned: {json.dumps(plan, ensure_ascii=False)[:1500]}")
+
+                        actions = plan.get("actions") or []
+                        if not isinstance(actions, list):
+                            await send({"type": "error", "error": "plan.actions must be a list"})
+                            break
+
+                        for idx, action in enumerate(actions):
+                            if cancel_flag:
+                                await send({"type": "status", "status": "cancelled"})
+                                break
+                            if not isinstance(action, dict):
+                                await send({"type": "error", "error": "action must be an object"})
+                                break
+                            res = await execute_action(action)
+                            await send({"type": "action_result", "index": idx, "result": res})
+                            memory.append(f"Executed action {idx}: {json.dumps(action, ensure_ascii=False)} => {json.dumps(res, ensure_ascii=False)[:800]}")
+
+                        b64_after, _png_after = await _ui_screenshot_b64(page)
+                        await send(
+                            {
+                                "type": "screenshot",
+                                "mime_type": "image/png",
+                                "data_b64": b64_after,
+                                "url": page.url,
+                            }
+                        )
+
+                        if bool(plan.get("done")) is True:
+                            await send({"type": "status", "status": "done", "note": plan.get("note") or ""})
+                            memory.append(f"Done: {plan.get('note') or ''}")
+                            break
+
+                    continue
+
+        except WebSocketDisconnect:
+            return
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 class AgentMessageRequest(BaseModel):
@@ -86,7 +511,7 @@ async def health() -> dict[str, Any]:
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
     location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-    status = check_live_model_availability(project, location)
+    status = await _check_live_model_availability_fast(project, location)
 
     return {
         "status": "ok" if status["live_models_available"] else "live_model_unavailable",
@@ -100,7 +525,7 @@ async def startup_check() -> dict[str, Any]:
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
     location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-    status = check_live_model_availability(project, location)
+    status = await _check_live_model_availability_fast(project, location)
 
     return {
         "project": project,
@@ -146,6 +571,7 @@ async def architecture() -> dict[str, Any]:
         "entrypoints": [
             {"method": "POST", "path": "/agent/message"},
             {"method": "POST", "path": "/agent/tool-result"},
+            {"method": "WS", "path": "/ws/live"},
         ],
         "diagnostics": [
             {"method": "GET", "path": "/health"},
@@ -161,6 +587,641 @@ async def architecture() -> dict[str, Any]:
             "Final response returned to client",
         ],
     }
+
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket) -> None:
+    """Realtime WS interface for Gemini Live.
+
+    This endpoint is intentionally minimal and demo-focused.
+
+    Client messages:
+    - {"type":"audio","mime_type":"audio/pcm","data_b64":"..."}
+    - {"type":"audio_end"}
+    - {"type":"interrupt"}
+    - {"type":"text","text":"..."}  (optional conditioning)
+
+    Server messages:
+    - {"type":"status","status":"connected"|"restarting",...,"session_id":N}
+    - {"type":"audio_config","sample_rate":24000,"format":"pcm_s16le",...,"session_id":N}
+    - {"type":"audio","mime_type":"audio/pcm","data_b64":"...","session_id":N}
+    - {"type":"transcript","text":"...","finished":false|true,"session_id":N}
+    - {"type":"interrupted","source":"client"|"upstream","session_id":N}
+    - {"type":"turn_complete","session_id":N}
+    - {"type":"error","error":"..."}
+    """
+
+    await websocket.accept()
+
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+    if not use_vertex or not project:
+        await websocket.send_json({"type": "error", "error": "Vertex Live not enabled"})
+        await websocket.close(code=1011)
+        return
+
+    # Do NOT pre-probe models.list() here; it can hang. We'll attempt a Live connect and if that
+    # fails we'll fall back to standard generation.
+    live_available: bool | None = None
+
+    mode = (websocket.query_params.get("mode") or "agent").strip().lower()
+    if mode not in {"agent", "stt"}:
+        mode = "agent"
+
+    output_mode = (websocket.query_params.get("output") or os.getenv("AERIVON_WS_OUTPUT") or "audio").strip().lower()
+    if output_mode not in {"audio", "text"}:
+        output_mode = "audio"
+
+    # STT mode forces TEXT output.
+    if mode == "stt":
+        output_mode = "text"
+
+    # This WS endpoint supports image messages; surface that explicitly so the UI
+    # doesn't show "vision=undefined".
+    vision_enabled = True
+
+    # Persistent per-user memory (optional).
+    user_id = _sanitize_user_id(websocket.query_params.get("user_id"))
+    user_memory: dict[str, Any] | None = None
+    memory_prompt = ""
+    if mode != "stt":
+        user_memory = await _load_user_memory(user_id=user_id)
+        memory_prompt = _memory_to_prompt(user_memory)
+
+    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+
+    client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+
+    voice_name = (websocket.query_params.get("voice") or os.getenv("AERIVON_LIVE_VOICE") or "").strip()
+    voice_lang = (websocket.query_params.get("lang") or os.getenv("AERIVON_LIVE_VOICE_LANG") or "en-US").strip()
+    speech_config: types.SpeechConfig | None = None
+    if voice_name:
+        speech_config = types.SpeechConfig(
+            language_code=voice_lang,
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+            ),
+        )
+
+    if mode == "stt":
+        system_instruction = (
+            "You are a real-time speech-to-text transcriber. "
+            "Transcribe ONLY what the user says. "
+            "Output ONLY the transcript text. No commentary, no punctuation requirements. "
+            "If you are unsure, output your best guess."
+        )
+    else:
+        system_instruction = "You are Aerivon Live. Be concise and helpful."
+        if memory_prompt:
+            system_instruction = f"{system_instruction}\n\n{memory_prompt}"
+
+    def _build_live_config(response_modalities: list[types.Modality]) -> types.LiveConnectConfig:
+        """Best-effort include generation_config (max tokens, temperature) for Live.
+
+        Some google-genai versions may not expose generation_config on LiveConnectConfig.
+        In that case, fall back to the minimal config rather than crashing.
+        """
+
+        gen_cfg = types.GenerationConfig(
+            max_output_tokens=AERIVON_LIVE_MAX_OUTPUT_TOKENS,
+            temperature=AERIVON_LIVE_TEMPERATURE,
+        )
+
+        base_kwargs: dict[str, Any] = {
+            "system_instruction": system_instruction,
+            "response_modalities": response_modalities,
+        }
+        if response_modalities == [types.Modality.AUDIO]:
+            base_kwargs["speech_config"] = speech_config
+            base_kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
+
+        # Try with generation_config; if unsupported, retry without it.
+        try:
+            return types.LiveConnectConfig(**base_kwargs, generation_config=gen_cfg)
+        except TypeError:
+            return types.LiveConnectConfig(**base_kwargs)
+
+    if output_mode == "audio":
+        session_config = _build_live_config([types.Modality.AUDIO])
+    else:
+        session_config = _build_live_config([types.Modality.TEXT])
+
+    try:
+        from websockets.exceptions import ConnectionClosed  # type: ignore
+    except Exception:  # pragma: no cover
+        ConnectionClosed = ()  # type: ignore
+
+    session_seq = 0
+
+    def _pcm_s16le_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+        import struct
+
+        # Minimal RIFF/WAVE header for PCM s16le.
+        byte_rate = sample_rate * channels * 2
+        block_align = channels * 2
+        data_size = len(pcm)
+        riff_size = 36 + data_size
+        return b"".join(
+            [
+                b"RIFF",
+                struct.pack("<I", riff_size),
+                b"WAVE",
+                b"fmt ",
+                struct.pack("<I", 16),  # PCM fmt chunk size
+                struct.pack("<H", 1),  # audio format = PCM
+                struct.pack("<H", channels),
+                struct.pack("<I", sample_rate),
+                struct.pack("<I", byte_rate),
+                struct.pack("<H", block_align),
+                struct.pack("<H", 16),  # bits per sample
+                b"data",
+                struct.pack("<I", data_size),
+                pcm,
+            ]
+        )
+
+    async def run_fallback_session() -> None:
+        """Non-Live fallback over the same WS shape (text responses only)."""
+
+        nonlocal session_seq
+        session_seq += 1
+        session_id = session_seq
+
+        async def ws_send(payload: dict[str, Any]) -> None:
+            payload.setdefault("session_id", session_id)
+            await websocket.send_json(payload)
+
+        # Pick a standard model available in this project.
+        preferred = os.getenv("AERIVON_WS_FALLBACK_MODEL", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"))
+        fallback_model = resolve_fallback_model(project, location, preferred)
+
+        await ws_send(
+            {
+                "type": "status",
+                "status": "connected",
+                "model": fallback_model,
+                "vision": True,
+                "output": "text",
+                "mode": "fallback",
+                "detail": "Gemini Live unavailable; using standard generate_content",
+                "user_id": user_id,
+            }
+        )
+
+        # State for mic buffering.
+        audio_pcm = bytearray()
+        last_text_prompt = ""
+
+        def gen_cfg() -> types.GenerateContentConfig:
+            return types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                max_output_tokens=AERIVON_LIVE_MAX_OUTPUT_TOKENS,
+                temperature=AERIVON_LIVE_TEMPERATURE,
+            )
+
+        async def _persist_exchange(*, user_text: str, model_text: str) -> None:
+            nonlocal user_memory
+            if not AERIVON_MEMORY_BUCKET:
+                return
+            if mode == "stt":
+                return
+
+            mem = user_memory if isinstance(user_memory, dict) else {}
+            exchanges = mem.get("exchanges")
+            if not isinstance(exchanges, list):
+                exchanges = []
+
+            exchanges.append(
+                {
+                    "t": int(time.time()),
+                    "user": (user_text or "").strip()[:2000],
+                    "model": (model_text or "").strip()[:4000],
+                }
+            )
+            exchanges = exchanges[-AERIVON_MEMORY_MAX_EXCHANGES :]
+            mem["user_id"] = user_id
+            mem["updated_at"] = int(time.time())
+            mem["exchanges"] = exchanges
+
+            # Cheap summary (no extra model call): truncate concatenation.
+            joined = " ".join(
+                [f"U:{ex.get('user','')} M:{ex.get('model','')}" for ex in exchanges if isinstance(ex, dict)]
+            )
+            mem["summary"] = joined[:1200]
+
+            user_memory = mem
+            await _save_user_memory(user_id=user_id, memory=mem)
+
+        async def generate_and_send(parts: list[types.Part], *, user_text_for_memory: str) -> None:
+            # Run sync generate_content in a thread so the event loop stays responsive.
+            def _run() -> str:
+                resp = client.models.generate_content(
+                    model=fallback_model,
+                    contents=[types.Content(role="user", parts=parts)],
+                    config=gen_cfg(),
+                )
+                cand = resp.candidates[0] if resp.candidates else None
+                out_parts = cand.content.parts if cand and cand.content else []
+                return "".join([p.text for p in out_parts if getattr(p, "text", None)])
+
+            text = ""
+            try:
+                text = await asyncio.to_thread(_run)
+                if text:
+                    await ws_send({"type": "text", "text": text})
+            except Exception as exc:
+                await ws_send({"type": "error", "error": str(exc)})
+            finally:
+                if text:
+                    await _persist_exchange(user_text=user_text_for_memory, model_text=text)
+                await ws_send({"type": "turn_complete"})
+
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                continue
+
+            msg_type = str(data.get("type") or "").strip().lower()
+
+            if msg_type == "interrupt":
+                audio_pcm.clear()
+                await ws_send({"type": "interrupted", "source": "client"})
+                await ws_send({"type": "turn_complete"})
+                continue
+
+            if msg_type == "text":
+                last_text_prompt = str(data.get("text") or "")
+                # Generate immediately for text-only turns.
+                if last_text_prompt.strip():
+                    await generate_and_send(
+                        [types.Part.from_text(text=last_text_prompt)],
+                        user_text_for_memory=last_text_prompt,
+                    )
+                continue
+
+            if msg_type == "image":
+                mime_type = str(data.get("mime_type") or "image/png")
+                b64 = str(data.get("data_b64") or "")
+                if not b64:
+                    await ws_send({"type": "error", "error": "missing data_b64"})
+                    continue
+                try:
+                    img = base64.b64decode(b64, validate=True)
+                except Exception:
+                    await ws_send({"type": "error", "error": "invalid base64"})
+                    continue
+
+                prompt = str(data.get("text") or "").strip() or last_text_prompt.strip() or "Describe the image."
+                await generate_and_send(
+                    [
+                        types.Part.from_text(text=prompt),
+                        types.Part.from_bytes(data=img, mime_type=mime_type),
+                    ],
+                    user_text_for_memory=prompt,
+                )
+                continue
+
+            if msg_type == "audio":
+                # Buffer PCM until audio_end.
+                b64 = str(data.get("data_b64") or "")
+                if not b64:
+                    continue
+                try:
+                    chunk = base64.b64decode(b64, validate=True)
+                except Exception:
+                    continue
+                # Keep a simple cap (~6s of 16kHz mono s16 = 192KB/sec). Allow ~2MB.
+                if len(audio_pcm) + len(chunk) <= 2 * 1024 * 1024:
+                    audio_pcm.extend(chunk)
+                continue
+
+            if msg_type == "audio_end":
+                if not audio_pcm:
+                    await ws_send({"type": "turn_complete"})
+                    continue
+                wav = _pcm_s16le_to_wav(bytes(audio_pcm), sample_rate=16000, channels=1)
+                audio_pcm.clear()
+                prompt = last_text_prompt.strip() or "Transcribe and respond to the user's audio."
+                await generate_and_send(
+                    [
+                        types.Part.from_text(text=prompt),
+                        types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                    ],
+                    user_text_for_memory="(voice message)",
+                )
+                continue
+
+            # Ignore unknown message types.
+
+
+    async def run_one_session() -> bool:
+        """Return True to restart (interrupt/upstream drop), False to stop."""
+        nonlocal session_seq
+        session_seq += 1
+        session_id = session_seq
+
+        async def ws_send(payload: dict[str, Any]) -> None:
+            payload.setdefault("session_id", session_id)
+            await websocket.send_json(payload)
+
+        # Turn buffers for persistent memory.
+        last_user_for_memory: str = ""
+        model_text_parts: list[str] = []
+
+        async def persist_exchange_if_any() -> None:
+            nonlocal user_memory
+            if not AERIVON_MEMORY_BUCKET:
+                return
+            if mode == "stt":
+                return
+            u = (last_user_for_memory or "").strip()
+            m = "".join(model_text_parts).strip()
+            if not u and not m:
+                return
+
+            mem = user_memory if isinstance(user_memory, dict) else {}
+            exchanges = mem.get("exchanges")
+            if not isinstance(exchanges, list):
+                exchanges = []
+            exchanges.append({"t": int(time.time()), "user": u[:2000], "model": m[:4000]})
+            exchanges = exchanges[-AERIVON_MEMORY_MAX_EXCHANGES :]
+            mem["user_id"] = user_id
+            mem["updated_at"] = int(time.time())
+            mem["exchanges"] = exchanges
+            joined = " ".join(
+                [f"U:{ex.get('user','')} M:{ex.get('model','')}" for ex in exchanges if isinstance(ex, dict)]
+            )
+            mem["summary"] = joined[:1200]
+            user_memory = mem
+            await _save_user_memory(user_id=user_id, memory=mem)
+
+        async with client.aio.live.connect(model=model, config=session_config) as stream:
+            await ws_send(
+                {
+                    "type": "status",
+                    "status": "connected",
+                    "model": model,
+                    "vision": vision_enabled,
+                    "output": output_mode,
+                    "mode": mode,
+                    "user_id": user_id,
+                    "audio_config": (
+                        {
+                            "sample_rate": DEFAULT_LIVE_AUDIO_SAMPLE_RATE,
+                            "format": "pcm_s16le",
+                            "channels": 1,
+                            "mime_type": "audio/pcm",
+                        }
+                        if output_mode == "audio"
+                        else None
+                    ),
+                }
+            )
+            if output_mode == "audio":
+                await ws_send(
+                    {
+                        "type": "audio_config",
+                        "sample_rate": DEFAULT_LIVE_AUDIO_SAMPLE_RATE,
+                        "format": "pcm_s16le",
+                        "channels": 1,
+                        "mime_type": "audio/pcm",
+                    }
+                )
+
+            async def recv_loop() -> None:
+                async for msg in stream.receive():
+                    data_bytes = getattr(msg, "data", None)
+                    if isinstance(data_bytes, (bytes, bytearray)) and data_bytes:
+                        await ws_send(
+                            {
+                                "type": "audio",
+                                "mime_type": "audio/pcm",
+                                "data_b64": base64.b64encode(bytes(data_bytes)).decode("ascii"),
+                            }
+                        )
+
+                    if output_mode == "text" and getattr(msg, "text", None):
+                        if mode != "stt" and msg.text:
+                            model_text_parts.append(str(msg.text))
+                        await ws_send({"type": "text", "text": msg.text})
+                        continue
+
+                    sc = getattr(msg, "server_content", None)
+                    if sc is not None and getattr(sc, "interrupted", None) is True:
+                        await ws_send({"type": "interrupted", "source": "upstream"})
+
+                    if sc is not None:
+                        # Some responses (notably vision) deliver text via model_turn parts.
+                        model_turn = getattr(sc, "model_turn", None)
+                        parts = getattr(model_turn, "parts", None) if model_turn is not None else None
+                        if parts:
+                            for part in parts:
+                                part_text = getattr(part, "text", None)
+                                if part_text:
+                                    if mode != "stt":
+                                        model_text_parts.append(str(part_text))
+                                    await ws_send({"type": "text", "text": part_text})
+
+                        otx = getattr(sc, "output_transcription", None)
+                        if otx is not None:
+                            tx_text = getattr(otx, "text", None)
+                            tx_finished = getattr(otx, "finished", None)
+                            if tx_text is not None or tx_finished is not None:
+                                if mode != "stt" and tx_text:
+                                    model_text_parts.append(str(tx_text))
+                                await ws_send(
+                                    {
+                                        "type": "transcript",
+                                        "text": tx_text,
+                                        "finished": bool(tx_finished) if tx_finished is not None else False,
+                                    }
+                                )
+
+                    if sc is not None and getattr(sc, "turn_complete", None) is True:
+                        await persist_exchange_if_any()
+                        model_text_parts.clear()
+                        last_user_for_memory = ""
+                        await ws_send({"type": "turn_complete"})
+
+            recv_task = asyncio.create_task(recv_loop())
+
+            async def restart(reason: str, detail: str = "") -> bool:
+                await ws_send(
+                    {
+                        "type": "status",
+                        "status": "restarting",
+                        "reason": reason,
+                        "detail": detail,
+                        "model": model,
+                        "vision": vision_enabled,
+                        "output": output_mode,
+                        "mode": mode,
+                    }
+                )
+                return True
+
+            async def safe_send_realtime_input(**kwargs: Any) -> bool:
+                try:
+                    await stream.send_realtime_input(**kwargs)
+                    return False
+                except ConnectionClosed as exc:  # type: ignore[misc]
+                    return await restart("upstream_disconnected", str(exc))
+
+            async def safe_send_client_content(*, turns: types.Content, turn_complete: bool = True) -> bool:
+                try:
+                    await stream.send_client_content(turns=turns, turn_complete=turn_complete)
+                    return False
+                except ConnectionClosed as exc:  # type: ignore[misc]
+                    return await restart("upstream_disconnected", str(exc))
+
+            try:
+                while True:
+                    # Wake periodically so upstream disconnects trigger a restart.
+                    try:
+                        data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        if recv_task.done():
+                            exc: Exception | None
+                            try:
+                                exc = recv_task.exception()
+                            except Exception:
+                                exc = None
+                            return await restart("upstream_disconnected", str(exc) if exc else "")
+                        continue
+
+                    if not isinstance(data, dict):
+                        continue
+
+                    msg_type = str(data.get("type") or "").strip().lower()
+                    if msg_type == "interrupt":
+                        # Deterministic: notify client immediately, stop forwarding old audio, then reconnect.
+                        try:
+                            await ws_send({"type": "interrupted", "source": "client"})
+                        except Exception:
+                            pass
+                        recv_task.cancel()
+                        return await restart("client_interrupt")
+
+                    if msg_type == "text":
+                        text = str(data.get("text") or "")
+                        if len(text) > MAX_MESSAGE_LENGTH:
+                            await ws_send({"type": "error", "error": "text too long"})
+                            continue
+                        # In audio output mode, client_content turns are the most reliable way
+                        # to trigger generation (send_realtime_input(text=...) may not yield audio).
+                        if output_mode == "audio" and mode != "stt":
+                            parts = [types.Part.from_text(text=text)]
+                            last_user_for_memory = text
+                            if await safe_send_client_content(
+                                turns=types.Content(role="user", parts=parts),
+                                turn_complete=True,
+                            ):
+                                return True
+                        else:
+                            last_user_for_memory = text
+                            if await safe_send_realtime_input(text=text):
+                                return True
+                        continue
+
+                    if msg_type == "audio":
+                        mime_type = str(data.get("mime_type") or "audio/pcm")
+                        b64 = str(data.get("data_b64") or "")
+                        if not b64:
+                            await ws_send({"type": "error", "error": "missing data_b64"})
+                            continue
+                        if len(b64) > (MAX_WS_MESSAGE_BYTES * 2):
+                            await ws_send({"type": "error", "error": "audio chunk too large"})
+                            continue
+                        try:
+                            chunk = base64.b64decode(b64, validate=True)
+                        except Exception:
+                            await ws_send({"type": "error", "error": "invalid base64"})
+                            continue
+                        if len(chunk) > MAX_WS_MESSAGE_BYTES:
+                            await ws_send({"type": "error", "error": "audio chunk too large"})
+                            continue
+                        if await safe_send_realtime_input(audio=types.Blob(data=chunk, mime_type=mime_type)):
+                            return True
+                        continue
+
+                    if msg_type == "audio_end":
+                        if not last_user_for_memory:
+                            last_user_for_memory = "(voice message)"
+                        if await safe_send_realtime_input(audio_stream_end=True):
+                            return True
+                        continue
+
+                    if msg_type == "image":
+                        mime_type = str(data.get("mime_type") or "image/png")
+                        if not mime_type.lower().startswith("image/"):
+                            await ws_send({"type": "error", "error": "invalid image mime_type"})
+                            continue
+                        b64 = str(data.get("data_b64") or "")
+                        if not b64:
+                            await ws_send({"type": "error", "error": "missing data_b64"})
+                            continue
+                        if len(b64) > (MAX_WS_MESSAGE_BYTES * 2):
+                            await ws_send({"type": "error", "error": "image chunk too large"})
+                            continue
+                        try:
+                            chunk = base64.b64decode(b64, validate=True)
+                        except Exception:
+                            await ws_send({"type": "error", "error": "invalid base64"})
+                            continue
+                        if len(chunk) > MAX_WS_MESSAGE_BYTES:
+                            await ws_send({"type": "error", "error": "image chunk too large"})
+                            continue
+
+                        prompt = str(data.get("text") or "")
+                        parts: list[types.Part] = []
+                        if prompt:
+                            parts.append(types.Part.from_text(text=prompt))
+                            last_user_for_memory = prompt
+                        parts.append(types.Part.from_bytes(data=chunk, mime_type=mime_type))
+
+                        if not last_user_for_memory:
+                            last_user_for_memory = "(image)"
+
+                        if await safe_send_client_content(turns=types.Content(role="user", parts=parts)):
+                            return True
+                        continue
+
+            finally:
+                try:
+                    await asyncio.wait_for(recv_task, timeout=1.0)
+                except asyncio.CancelledError:
+                    # Python 3.14: CancelledError may not be caught by Exception.
+                    pass
+                except Exception:
+                    recv_task.cancel()
+                    try:
+                        await recv_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+
+    try:
+        while True:
+            try:
+                should_restart = await run_one_session()
+            except Exception:
+                # Live connect/runtime failed; fall back to standard generation so the client
+                # still gets a response.
+                await run_fallback_session()
+                return
+
+            if not should_restart:
+                break
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        # Best effort: report the error then close.
+        try:
+            await websocket.send_json({"type": "error", "error": str(exc)})
+        finally:
+            await websocket.close(code=1011)
 
 
 @app.get("/agent/self-test")

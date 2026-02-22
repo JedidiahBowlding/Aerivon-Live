@@ -18,7 +18,41 @@ Key features:
 - Prompt-injection hardening (API + agent + model instruction)
 - Cost controls (timeout, tool-call cap) + API limits (rate limit, size caps, bounded session memory)
 
+## Submission docs
+- Project writeup: [SUBMISSION.md](SUBMISSION.md)
+- Demo checklist: [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md)
+
 ## Run locally
+
+One-command dev runner:
+
+```bash
+./aerivon
+```
+
+### Persistent memory (GCS)
+
+Optional: persist per-user memory across reconnects by setting a GCS bucket.
+
+```bash
+export AERIVON_MEMORY_BUCKET="your-gcs-bucket"
+```
+
+The backend will read/write `gs://$AERIVON_MEMORY_BUCKET/memory/<user_id>.json`.
+
+Create a bucket (example):
+
+```bash
+gcloud storage buckets create gs://YOUR_BUCKET \
+  --project aerivon-live-agent \
+  --location us-central1 \
+  --uniform-bucket-level-access
+```
+
+The runtime identity (your local ADC or service account) needs `storage.objects.get` and
+`storage.objects.create` on that bucket (e.g. `roles/storage.objectAdmin`).
+
+Manual backend run (optional):
 
 ```bash
 cd backend
@@ -37,6 +71,43 @@ curl http://localhost:8080/agent/startup-check
 curl http://localhost:8080/agent/security-check
 curl http://localhost:8080/agent/self-test
 curl http://localhost:8080/agent/architecture
+
+# Real-time (Live Agents)
+
+Aerivon Live exposes a real-time WebSocket for Live Agents demos:
+
+- WS: `ws://localhost:8080/ws/live`
+- Supports interruption via `{ "type": "interrupt" }`
+
+Optional query params:
+
+- `?output=text` (default) or `?output=audio` (Live audio output + transcription)
+- `?voice=VOICE_NAME&lang=en-US` (voice selection; must be set at session start)
+
+Message formats:
+
+- Text: `{ "type": "text", "text": "..." }`
+- Audio chunk: `{ "type": "audio", "mime_type": "audio/wav", "data_b64": "..." }`
+- Audio end: `{ "type": "audio_end" }`
+- Image frame: `{ "type": "image", "mime_type": "image/png", "data_b64": "..." }`
+
+Server streams:
+
+- `{ "type": "text", "text": "..." }`
+- `{ "type": "audio", "mime_type": "audio/pcm", "data_b64": "..." }` (when `output=audio`)
+- `{ "type": "transcript", "text": "...", "finished": false }` (when `output=audio`)
+- `{ "type": "interrupted" }`
+- `{ "type": "turn_complete" }`
+
+Tip: keep audio chunks small (e.g. 50–200KB base64 per frame).
+
+### Realtime vision model
+
+If your project has a specific vision-capable Live model, set:
+
+`GEMINI_LIVE_VISION_MODEL="..."`
+
+Aerivon will probe candidates and report the selected `model` + `vision` flag in the initial WS `status` message.
 ```
 
 ## Demo request
@@ -45,12 +116,23 @@ curl http://localhost:8080/agent/architecture
 curl -X POST http://localhost:8080/agent/message \
   -H "Content-Type: application/json" \
   -d '{"message":"Find 3 dentists in Miami and generate outreach messages"}'
+
+## Audio output (TTS)
+
+Generate an MP3 response using Google Cloud Text-to-Speech:
+
+```bash
+curl -sS -X POST http://localhost:8080/agent/speak \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello from Aerivon Live"}' \
+  -o /tmp/aerivon_tts.mp3
+```
 ```
 
 ## Cloud Run deploy
 
 ```bash
-gcloud run deploy aerivon-live \
+gcloud run deploy aerivon-live-agent \
   --source backend \
   --region us-central1 \
   --allow-unauthenticated \
@@ -59,6 +141,37 @@ gcloud run deploy aerivon-live \
   --timeout 60 \
   --max-instances 2
 ```
+
+## Cloud Run (host frontend too)
+
+Deploy backend (already in this repo):
+
+```bash
+SERVICE_NAME=aerivon-live-agent REGION=us-central1 PROJECT_ID=aerivon-live-agent \
+  SERVICE_ACCOUNT=aerivon-live-run@aerivon-live-agent.iam.gserviceaccount.com \
+  GOOGLE_CLOUD_LOCATION=us-central1 \
+  AERIVON_MEMORY_BUCKET=aerivon-live-agent-memory-1771792693 \
+  scripts/deploy_cloud_run.sh
+```
+
+Deploy frontend (Cloud Run) and point it at the backend:
+
+```bash
+BACKEND_URL=$(gcloud run services describe aerivon-live-agent --region us-central1 --format='value(status.url)')
+gcloud run deploy aerivon-live-frontend \
+  --project aerivon-live-agent \
+  --region us-central1 \
+  --source frontend \
+  --allow-unauthenticated \
+  --set-env-vars "AERIVON_BACKEND_BASE=$BACKEND_URL"
+```
+
+## Automated cloud deployment (bonus)
+
+This repo includes automation artifacts you can link in your submission:
+
+- Scripted Cloud Run deploy: [scripts/deploy_cloud_run.sh](scripts/deploy_cloud_run.sh)
+- Cloud Build (IaC-style) deploy config: [cloudbuild.yaml](cloudbuild.yaml)
 
 ## Notes
 

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_DIR="$ROOT_DIR/backend"
+FRONTEND_DIR="$ROOT_DIR/frontend"
+
+PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-aerivon-live-agent}"
+LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
+USE_VERTEX="${GOOGLE_GENAI_USE_VERTEXAI:-True}"
+
+# Persistent memory (GCS)
+MEMORY_BUCKET="${AERIVON_MEMORY_BUCKET:-aerivon-live-agent-memory-1771792693}"
+
+BACKEND_PORT="${AERIVON_BACKEND_PORT:-8080}"
+FRONTEND_PORT="${AERIVON_FRONTEND_PORT:-5173}"
+RELOAD="${AERIVON_RELOAD:-1}"
+
+KEY_PATH_DEFAULT="$BACKEND_DIR/snark-shot-5f3a4ada1b7c.json"
+KEY_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$KEY_PATH_DEFAULT}"
+
+LIVE_MAX_TOKENS="${AERIVON_LIVE_MAX_OUTPUT_TOKENS:-2500}"
+
+usage() {
+  cat <<EOF
+Usage:
+  ./aerivon
+
+Environment overrides:
+  GOOGLE_APPLICATION_CREDENTIALS   Path to service account JSON (default: backend/snark-shot-5f3a4ada1b7c.json)
+  GOOGLE_CLOUD_PROJECT             (default: aerivon-live-agent)
+  GOOGLE_CLOUD_LOCATION            (default: us-central1)
+  AERIVON_BACKEND_PORT             (default: 8080)
+  AERIVON_FRONTEND_PORT            (default: 5173; auto-increments if busy)
+  AERIVON_LIVE_MAX_OUTPUT_TOKENS   (default: 1500)
+  AERIVON_RELOAD                   1 to enable uvicorn --reload (default: 1)
+  AERIVON_MEMORY_BUCKET            (default: aerivon-live-agent-memory-1771792693)
+
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }
+}
+
+port_in_use() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+need_cmd python3
+need_cmd curl
+need_cmd lsof
+
+if [[ ! -d "$BACKEND_DIR" || ! -f "$BACKEND_DIR/server.py" ]]; then
+  echo "Backend not found at: $BACKEND_DIR"
+  exit 1
+fi
+if [[ ! -d "$FRONTEND_DIR" || ! -f "$FRONTEND_DIR/index.html" ]]; then
+  echo "Frontend not found at: $FRONTEND_DIR"
+  exit 1
+fi
+
+if [[ ! -f "$KEY_PATH" ]]; then
+  echo "Service account key not found: $KEY_PATH"
+  echo "Set GOOGLE_APPLICATION_CREDENTIALS to the correct path."
+  exit 1
+fi
+
+if port_in_use "$BACKEND_PORT"; then
+  echo "Port $BACKEND_PORT is already in use. Set AERIVON_BACKEND_PORT to a free port."
+  exit 1
+fi
+
+while port_in_use "$FRONTEND_PORT"; do
+  FRONTEND_PORT=$((FRONTEND_PORT + 1))
+done
+
+VENV_DIR="$BACKEND_DIR/.venv"
+PY_BIN="$VENV_DIR/bin/python"
+UVICORN_BIN="$VENV_DIR/bin/uvicorn"
+
+if [[ ! -x "$PY_BIN" ]]; then
+  echo "Creating backend venv…"
+  (cd "$BACKEND_DIR" && python3 -m venv .venv)
+fi
+
+echo "Installing backend dependencies (pip)…"
+(cd "$BACKEND_DIR" && "$PY_BIN" -m pip install -q --upgrade pip && "$PY_BIN" -m pip install -q -r requirements.txt)
+
+echo "Ensuring Playwright Chromium is installed…"
+(cd "$BACKEND_DIR" && "$PY_BIN" -m playwright install chromium >/dev/null)
+
+export GOOGLE_APPLICATION_CREDENTIALS="$KEY_PATH"
+export GOOGLE_GENAI_USE_VERTEXAI="$USE_VERTEX"
+export GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
+export GOOGLE_CLOUD_LOCATION="$LOCATION"
+export AERIVON_LIVE_MAX_OUTPUT_TOKENS="$LIVE_MAX_TOKENS"
+export AERIVON_MEMORY_BUCKET="$MEMORY_BUCKET"
+
+UVICORN_ARGS=(server:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port "$BACKEND_PORT")
+if [[ "$RELOAD" == "1" || "$RELOAD" == "true" || "$RELOAD" == "True" ]]; then
+  UVICORN_ARGS+=(--reload)
+fi
+
+echo "Starting backend: http://127.0.0.1:$BACKEND_PORT"
+"$UVICORN_BIN" "${UVICORN_ARGS[@]}" >/tmp/aerivon_backend.log 2>&1 &
+BACKEND_PID=$!
+
+cleanup() {
+  echo "\nStopping Aerivon…"
+  if [[ -n "${BACKEND_PID:-}" ]]; then
+    kill "$BACKEND_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${FRONTEND_PID:-}" ]]; then
+    kill "$FRONTEND_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+echo "Starting frontend: http://127.0.0.1:$FRONTEND_PORT"
+(cd "$FRONTEND_DIR" && python3 -m http.server "$FRONTEND_PORT" >/tmp/aerivon_frontend.log 2>&1) &
+FRONTEND_PID=$!
+
+# Wait for backend health.
+echo "Waiting for backend to become healthy…"
+for _ in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
+echo ""
+echo "Aerivon is running:"
+echo "  Frontend: http://127.0.0.1:$FRONTEND_PORT"
+echo "  Backend:  http://127.0.0.1:$BACKEND_PORT"
+echo "  Health:   http://127.0.0.1:$BACKEND_PORT/health"
+echo ""
+echo "Logs:"
+echo "  Backend:  /tmp/aerivon_backend.log"
+echo "  Frontend: /tmp/aerivon_frontend.log"
+echo ""
+echo "Press Ctrl+C to stop."
+
+wait "$BACKEND_PID" "$FRONTEND_PID"

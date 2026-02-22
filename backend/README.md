@@ -42,6 +42,15 @@ curl http://localhost:8080/agent/architecture
 curl -X POST http://localhost:8080/agent/message \
   -H "Content-Type: application/json" \
   -d '{"message":"Find dentists in Miami and generate outreach message"}'
+
+## Audio output (TTS)
+
+```bash
+curl -sS -X POST http://localhost:8080/agent/speak \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello from Aerivon Live"}' \
+  -o /tmp/aerivon_tts.mp3
+```
 ```
 
 Note: `scrape_leads` may return a `robots.txt` block depending on the target site. This is intentional and demonstrates compliant scraping behavior.
@@ -61,6 +70,18 @@ Note: `scrape_leads` may return a `robots.txt` block depending on the target sit
 - `POST /agent/message`
   - Input: `{ "message": "..." }`
   - Output: `{ "response": "...", "tool_calls": [...] }`
+- `POST /agent/message-multimodal`
+  - Multipart form fields: `message` (optional), `image` or `screenshot` (optional), `audio` (optional)
+  - Output: `{ "response": "...", "tool_calls": [...] }`
+- `WS /ws/live`
+  - Real-time Live Agents interface (streaming text + audio chunks)
+  - Supports interruption via `{ "type": "interrupt" }`
+  - Supports realtime vision frames via `{ "type": "image", "mime_type": "image/png", "data_b64": "..." }`
+  - Optional override: `GEMINI_LIVE_VISION_MODEL="..."`
+  - Query params:
+    - `?output=text` (default) or `?output=audio` (Live audio output + transcription)
+    - `?voice=VOICE_NAME&lang=en-US` (voice selection)
+  - Server emits `{ "type": "audio" }`, `{ "type": "transcript" }`, and `{ "type": "interrupted" }` events
 - `POST /agent/tool-result`
   - Allows externally provided tool results to be stored (bounded by size and session caps).
 

@@ -1,0 +1,35 @@
+# Cloud Build config to automate Cloud Run deployments.
+#
+# Create a trigger in Cloud Build pointing at your repo/branch and set substitutions.
+#
+# Substitutions (set in trigger UI or gcloud):
+#   _SERVICE_NAME (default: aerivon-live)
+#   _REGION       (default: us-central1)
+#   _SOURCE_DIR   (default: backend)
+#
+substitutions:
+  _SERVICE_NAME: aerivon-live-agent
+  _REGION: us-central1
+  _SOURCE_DIR: backend
+
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -euo
+      - pipefail
+      - -c
+      - |
+        gcloud run deploy "${_SERVICE_NAME}" \
+          --region "${_REGION}" \
+          --source "${_SOURCE_DIR}" \
+          --allow-unauthenticated \
+          --memory 512Mi \
+          --cpu 1 \
+          --timeout 60 \
+          --max-instances 2 \
+          --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=True" \
+          --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY

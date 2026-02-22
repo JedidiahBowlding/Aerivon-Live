@@ -1,0 +1,16 @@
+# Prevent accidental upload of secrets / local-only files when using:
+#   gcloud run deploy --source backend
+
+# Python caches / venv
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local environment files
+.env
+.env.*
+
+# Service account / credential JSONs
+*.json
+snark-shot-*.json

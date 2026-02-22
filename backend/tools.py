@@ -205,6 +205,8 @@ def browse_url(url: str) -> dict[str, Any]:
                 "phone": contacts["phone"],
                 "page_title": title,
                 "screenshot_path": str(screenshot_path),
+                "screenshot_artifact": screenshot_path.name,
+                "screenshot_endpoint": f"/artifacts/{screenshot_path.name}",
                 "content_preview": preview,
             }
         )
