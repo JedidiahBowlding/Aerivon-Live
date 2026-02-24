@@ -124,7 +124,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting frontend: http://127.0.0.1:$FRONTEND_PORT"
-(cd "$FRONTEND_DIR" && python3 -m http.server "$FRONTEND_PORT" >/tmp/aerivon_frontend.log 2>&1) &
+# Use the frontend FastAPI server so it can inject AERIVON_BACKEND_BASE and all pages
+# will talk to the backend without needing ?backend=... manually.
+export AERIVON_BACKEND_BASE="http://127.0.0.1:$BACKEND_PORT"
+(cd "$FRONTEND_DIR" && "$UVICORN_BIN" server:app --app-dir "$FRONTEND_DIR" --host 127.0.0.1 --port "$FRONTEND_PORT" >/tmp/aerivon_frontend.log 2>&1) &
 FRONTEND_PID=$!
 
 # Wait for backend health.

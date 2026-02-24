@@ -4,5 +4,6 @@ google-genai
 playwright
 python-dotenv
 google-cloud-storage
+google-cloud-firestore
 python-multipart
 google-cloud-texttospeech

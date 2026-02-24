@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aerivon Live – UI Navigator</title>
+    <link rel="icon" href="./assets/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="./assets/favicon-96x96.png" sizes="96x96" />
+    <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
+    <link rel="manifest" href="./assets/site.webmanifest" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+      .logo { width: 36px; height: 36px; border-radius: 8px; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      input { padding: 10px 12px; }
+      button { padding: 10px 14px; }
+      .muted { color: #666; }
+      #agentState { display: inline-block; }
+      .state-idle { color: #00c853; }
+      .state-speaking { color: #2962ff; }
+      .state-interrupted { color: #ff6d00; }
+      .pulse-once { animation: pulse 0.4s ease-out; }
+      @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.08); }
+        100% { transform: scale(1); }
+      }
+      .spacer { height: 14px; }
+      #log { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; min-height: 90px; color: #333; }
+      code { background: #f6f8fa; padding: 2px 6px; border-radius: 6px; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
+      <h1 style="margin: 0">UI Navigator</h1>
+      <span class="muted"><a href="./index.html">Home</a></span>
+    </div>
+
+    <div class="row">
+      <input id="navUrl" type="text" placeholder="https://example.com" style="min-width: 320px;" />
+      <button id="navOpenBtn">Open URL</button>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="row">
+      <input id="navTask" type="text" placeholder="e.g., click Sign up, then type my email" style="min-width: 520px;" />
+      <button id="navRunBtn">Run Task</button>
+      <button id="navSpeakBtn">🎙️ Speak Task</button>
+      <button id="navInterruptBtn">Interrupt</button>
+      <span class="muted">State: <strong id="agentState">IDLE</strong></span>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="muted">Navigator WS: <code id="navWsUrl"></code></div>
+
+    <div class="spacer"></div>
+
+    <img id="navImg" alt="Navigator screenshot" style="max-width: 100%; border: 1px solid #ddd; border-radius: 8px;" />
+
+    <div class="spacer"></div>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

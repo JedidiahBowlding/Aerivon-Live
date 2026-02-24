@@ -1,3 +1,4 @@
+// Elements are optional depending on which page is loaded.
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const uploadImgBtn = document.getElementById('uploadImgBtn');
@@ -18,6 +19,19 @@ const navInterruptBtn = document.getElementById('navInterruptBtn');
 const navImgEl = document.getElementById('navImg');
 const navWsUrlEl = document.getElementById('navWsUrl');
 const uploadPreviewEl = document.getElementById('uploadPreview');
+
+const HAS_LIVE_AGENT_UI = !!(startBtn && stopBtn && statusEl && stateBadgeEl && transcriptEl && logEl && wsUrlEl);
+const HAS_UI_NAVIGATOR_UI = !!(navUrlEl && navTaskEl && navOpenBtn && navRunBtn && navSpeakBtn && navInterruptBtn && navImgEl && navWsUrlEl);
+const INTERRUPT_DEBUG = (() => {
+  try {
+    const qp = new URLSearchParams(location.search).get('debug');
+    if (qp === '1' || qp === 'true') return true;
+    const ls = localStorage.getItem('aerivon_interrupt_debug');
+    return ls === '1' || ls === 'true';
+  } catch {
+    return false;
+  }
+})();
 
 let navWs = null;
 let navSpeechActive = false;
@@ -41,15 +55,32 @@ let navSpeakBusy = false;
 const TARGET_INPUT_SAMPLE_RATE = 16000;
 let playbackSampleRate = 24000;
 
+const AgentState = {
+  IDLE: 'IDLE',
+  LISTENING: 'LISTENING',
+  SPEAKING: 'SPEAKING',
+  INTERRUPTED: 'INTERRUPTED',
+};
+
 // Very small client-side VAD so Live reliably produces multiple turns.
 // Without explicit audio_end, some Live configs will only answer once (or wait indefinitely).
-const VAD_SPEECH_RMS = 0.012;      // tuned for typical laptop mics; adjust if needed
+const VAD_SPEECH_RMS = 0.010;      // tuned for typical laptop mics; adjust if needed
 const VAD_SILENCE_MS = 700;        // end-of-utterance after this much silence
 
 // When the model is speaking, the mic may pick up speaker leakage even with echoCancellation.
 // Use a higher threshold and require consecutive frames to avoid self-interrupting mid-sentence.
-const BARGE_IN_RMS = 0.022;
-const BARGE_IN_FRAMES = 3;
+const BARGE_IN_RMS = 0.045;
+const BARGE_IN_FRAMES = 1;
+
+const VAD_IDLE_THRESHOLD = 0.010;
+const VAD_SPEAKING_THRESHOLD = 0.018;
+const VAD_TRIGGER_MS = 90;
+const VAD_COOLDOWN_MS = 350;
+const VAD_MIN_TRIGGER_RMS = 0.0030;
+const VAD_MAX_TRIGGER_RMS = 0.020;
+const VAD_NOISE_MULTIPLIER = 2.0;
+const AGGRESSIVE_INTERRUPT_RMS = 0.010;
+const AGGRESSIVE_INTERRUPT_MS = 55;
 
 // STT needs a longer silence window so natural pauses don't end the utterance mid-sentence.
 const STT_SPEECH_RMS = 0.010;
@@ -65,15 +96,77 @@ let sourceNode = null;
 let playbackCtx = null;
 let playCursor = 0;
 let activeSources = [];
+let playbackGainNode = null;
 
 let inUtterance = false;
 let lastVoiceMs = 0;
-let currentState = 'idle';
-let lastInterruptSentMs = 0;
-let bargeInFrames = 0;
+let agentState = AgentState.IDLE;
+let lastInterruptAt = 0;
+let interruptLock = false;
+let vadActiveMs = 0;
+let vadLastTs = performance.now();
 let serverSessionId = null;
 let suppressOutputUntilConnected = false;
 let pendingTurnComplete = false;
+let lastServerOutputAt = 0;
+let vadNoiseFloor = 0.0015;
+let aggressiveVadMs = 0;
+let debugPanelEl = null;
+let debugRowsEl = null;
+let lastDebugMicTs = 0;
+
+function ensureInterruptDebugPanel() {
+  if (!INTERRUPT_DEBUG || debugPanelEl) return;
+  const panel = document.createElement('div');
+  panel.id = 'interruptDebugPanel';
+  panel.style.position = 'fixed';
+  panel.style.right = '12px';
+  panel.style.bottom = '12px';
+  panel.style.width = '340px';
+  panel.style.maxHeight = '46vh';
+  panel.style.overflow = 'auto';
+  panel.style.zIndex = '99999';
+  panel.style.background = 'rgba(17,17,17,0.92)';
+  panel.style.color = '#e6e6e6';
+  panel.style.border = '1px solid rgba(255,255,255,0.2)';
+  panel.style.borderRadius = '8px';
+  panel.style.padding = '8px';
+  panel.style.font = '12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace';
+
+  const title = document.createElement('div');
+  title.textContent = 'Interrupt Debug';
+  title.style.fontWeight = '700';
+  title.style.marginBottom = '6px';
+  panel.appendChild(title);
+
+  const rows = document.createElement('pre');
+  rows.style.margin = '0';
+  rows.style.whiteSpace = 'pre-wrap';
+  rows.style.wordBreak = 'break-word';
+  panel.appendChild(rows);
+
+  debugPanelEl = panel;
+  debugRowsEl = rows;
+  document.body.appendChild(panel);
+}
+
+function interruptDebug(kv = {}, event = '') {
+  if (!INTERRUPT_DEBUG) return;
+  ensureInterruptDebugPanel();
+  if (!debugRowsEl) return;
+
+  const merged = {
+    state: agentState,
+    ws: ws ? ws.readyState : -1,
+    queued: isAudioPlayingOrQueued(),
+    lock: interruptLock,
+    vadMs: Math.round(vadActiveMs),
+    ...kv,
+  };
+  const entries = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join(' | ');
+  const line = `[${nowMs()}] ${event || 'tick'} ${entries}`;
+  debugRowsEl.textContent = `${line}\n${debugRowsEl.textContent}`.slice(0, 6000);
+}
 
 function rms(float32) {
   let sum = 0;
@@ -85,36 +178,172 @@ function rms(float32) {
 }
 
 function setState(state) {
-  // states: idle, listening, thinking, speaking, interrupted
-  currentState = state;
-  stateBadgeEl.className = 'muted';
-  stateBadgeEl.style.color = '';
-  if (state === 'listening') stateBadgeEl.textContent = '🟢 Listening';
-  else if (state === 'thinking') stateBadgeEl.textContent = '🟡 Thinking';
-  else if (state === 'speaking') stateBadgeEl.textContent = '🔵 Speaking';
-  else if (state === 'interrupted') stateBadgeEl.textContent = '🔴 Interrupted';
-  else stateBadgeEl.textContent = 'idle';
+  if (state === 'idle') {
+    updateUIState(AgentState.IDLE);
+    return;
+  }
+  if (state === 'speaking') {
+    updateUIState(AgentState.SPEAKING);
+    return;
+  }
+  if (state === 'interrupted') {
+    updateUIState(AgentState.INTERRUPTED);
+    return;
+  }
+  // idle/listening/thinking collapse to LISTENING for judge-facing state machine.
+  updateUIState(AgentState.LISTENING);
+}
+
+function updateUIState(state) {
+  agentState = state;
+
+  const stateEl = document.getElementById('agentState');
+  if (stateEl) {
+    stateEl.textContent = state;
+    stateEl.classList.remove('state-idle', 'state-speaking', 'state-interrupted', 'pulse-once');
+    if (state === AgentState.LISTENING) {
+      stateEl.classList.add('state-idle');
+    } else if (state === AgentState.SPEAKING) {
+      stateEl.classList.add('state-speaking');
+    } else if (state === AgentState.INTERRUPTED) {
+      stateEl.classList.add('state-interrupted');
+      stateEl.offsetWidth;
+      stateEl.classList.add('pulse-once');
+    }
+  }
+
+  if (stateBadgeEl) {
+    stateBadgeEl.className = 'muted';
+    stateBadgeEl.style.color = '';
+    if (state === AgentState.IDLE) stateBadgeEl.textContent = '⚪ Idle';
+    else if (state === AgentState.LISTENING) stateBadgeEl.textContent = '🟢 Listening';
+    else if (state === AgentState.SPEAKING) stateBadgeEl.textContent = '🔵 Speaking';
+    else if (state === AgentState.INTERRUPTED) stateBadgeEl.textContent = '🟠 Interrupted';
+    else stateBadgeEl.textContent = 'idle';
+  }
+
+  setDucking(state === AgentState.SPEAKING);
 }
 
 function maybeSendBargeInInterrupt() {
-  // If the model is speaking and the user starts talking, explicitly interrupt.
-  // This is more reliable than waiting for upstream 'interrupted' signals.
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  if (currentState !== 'speaking' && !isAudioPlayingOrQueued()) return;
+  triggerInterrupt(ws, 'barge-in');
+}
 
-  const t = performance.now();
-  if (t - lastInterruptSentMs < 800) return; // debounce
-  lastInterruptSentMs = t;
+function triggerInterrupt(targetWs, source = 'barge-in') {
+  if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
+    interruptDebug({ source }, 'interrupt_skip:ws_not_open');
+    return false;
+  }
+  if (interruptLock) {
+    interruptDebug({ source }, 'interrupt_skip:lock');
+    return false;
+  }
+
+  const now = performance.now();
+  if (now - lastInterruptAt < VAD_COOLDOWN_MS) {
+    interruptDebug({ source, sinceMs: Math.round(now - lastInterruptAt) }, 'interrupt_skip:cooldown');
+    return false;
+  }
+  interruptLock = true;
+  lastInterruptAt = now;
+
+  updateUIState(AgentState.INTERRUPTED);
+  suppressOutputUntilConnected = true;
+  stopPlayback();
 
   try {
-    ws.send(JSON.stringify({ type: 'interrupt' }));
+    targetWs.send(JSON.stringify({ type: 'interrupt' }));
   } catch {
     // ignore
   }
-  log('Sent interrupt (barge-in)');
-  suppressOutputUntilConnected = true;
-  stopPlayback();
-  setState('interrupted');
+
+  log(`Sent interrupt (${source})`);
+  interruptDebug({ source }, 'interrupt_sent');
+  updateUIState(AgentState.LISTENING);
+  setTimeout(() => {
+    interruptLock = false;
+  }, 400);
+  setTimeout(() => {
+    console.assert(!isAudioPlayingOrQueued(), 'Audio still queued after interrupt!');
+  }, 0);
+  return true;
+}
+
+function handleMicFrameForBargeIn(frame, targetWs, source = 'barge-in') {
+  const now = performance.now();
+  const dt = now - vadLastTs;
+  vadLastTs = now;
+
+  const level = rms(frame);
+  const speakingWindowActive = (now - lastServerOutputAt) < 8000;
+  const speakingGateActive = agentState === AgentState.SPEAKING || isAudioPlayingOrQueued() || speakingWindowActive;
+
+  // Learn ambient noise only when the agent is not speaking and no recent output is active.
+  if (!speakingGateActive) {
+    vadNoiseFloor = Math.min(0.02, Math.max(0.0005, vadNoiseFloor * 0.985 + level * 0.015));
+  } else {
+    // During speaking windows, only decay slowly to avoid echo-driven threshold inflation.
+    vadNoiseFloor = Math.max(0.0005, vadNoiseFloor * 0.995);
+  }
+
+  const dynamicThreshold = Math.min(VAD_MAX_TRIGGER_RMS, Math.max(VAD_MIN_TRIGGER_RMS, vadNoiseFloor * VAD_NOISE_MULTIPLIER));
+  const dynamicIdleThreshold = Math.max(0.002, dynamicThreshold * 0.65);
+
+  if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
+    lastDebugMicTs = now;
+    interruptDebug(
+      {
+        source,
+        level: level.toFixed(4),
+        thr: dynamicThreshold.toFixed(4),
+        idleThr: dynamicIdleThreshold.toFixed(4),
+        noiseFloor: vadNoiseFloor.toFixed(4),
+        speakingWindowActive,
+        dt: Math.round(dt),
+      },
+      'mic'
+    );
+  }
+
+  if (!speakingGateActive) {
+    if (level > AGGRESSIVE_INTERRUPT_RMS) aggressiveVadMs += dt;
+    else aggressiveVadMs = Math.max(0, aggressiveVadMs - dt * 2);
+
+    if (aggressiveVadMs >= AGGRESSIVE_INTERRUPT_MS) {
+      aggressiveVadMs = 0;
+      interruptDebug({ source, level: level.toFixed(4) }, 'interrupt_aggressive_fallback');
+      return triggerInterrupt(targetWs, `${source}:aggressive`);
+    }
+
+    vadActiveMs = 0;
+    if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
+      interruptDebug({ source, aggressiveVadMs: Math.round(aggressiveVadMs) }, 'interrupt_skip:not_speaking_or_not_queued');
+    }
+    return false;
+  }
+
+  aggressiveVadMs = 0;
+
+  if (now - lastInterruptAt < VAD_COOLDOWN_MS) {
+    if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
+      interruptDebug({ source, sinceMs: Math.round(now - lastInterruptAt) }, 'interrupt_skip:cooldown');
+    }
+    return false;
+  }
+
+  if (level > dynamicThreshold) vadActiveMs += dt;
+  else if (level < dynamicIdleThreshold) vadActiveMs = Math.max(0, vadActiveMs - dt * 2);
+
+  if (vadActiveMs >= VAD_TRIGGER_MS) {
+    vadActiveMs = 0;
+    return triggerInterrupt(targetWs, source);
+  }
+
+  if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
+    interruptDebug({ source, level: level.toFixed(4) }, 'interrupt_hold:insufficient_vad');
+  }
+
+  return false;
 }
 
 function nowMs() {
@@ -122,16 +351,19 @@ function nowMs() {
 }
 
 function log(line) {
+  if (!logEl) return;
   logEl.textContent += `[${nowMs()}] ${line}\n`;
   logEl.scrollTop = logEl.scrollHeight;
 }
 
 function setStatus(text, muted = false) {
+  if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.className = muted ? 'muted' : '';
 }
 
 function appendTranscript(text) {
+  if (!transcriptEl) return;
   transcriptEl.textContent += text;
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
@@ -334,12 +566,21 @@ function int16ToFloat32(int16) {
 }
 
 function stopPlayback() {
-  if (!playbackCtx) return;
-  for (const src of activeSources) {
-    try { src.stop(); } catch {}
+  if (!playbackCtx) {
+    activeSources.length = 0;
+    pendingTurnComplete = false;
+    return;
   }
-  activeSources = [];
+
+  activeSources.forEach((src) => {
+    try { src.stop(0); } catch {}
+  });
+  activeSources.length = 0;
   playCursor = playbackCtx.currentTime;
+
+  if (playbackCtx.state === 'running') {
+    playbackCtx.suspend().then(() => playbackCtx.resume()).catch(() => {});
+  }
   pendingTurnComplete = false;
 }
 
@@ -365,7 +606,15 @@ function ensurePlaybackCtx() {
   } catch {
     playbackCtx = new Ctx();
   }
+  playbackGainNode = playbackCtx.createGain();
+  playbackGainNode.gain.value = 1.0;
+  playbackGainNode.connect(playbackCtx.destination);
   playCursor = playbackCtx.currentTime;
+}
+
+function setDucking(on) {
+  if (!playbackGainNode) return;
+  playbackGainNode.gain.value = on ? 0.65 : 1.0;
 }
 
 async function applyAudioConfig(sampleRate) {
@@ -391,7 +640,7 @@ function enqueuePcmForPlayback(pcmBytes) {
 
   const src = playbackCtx.createBufferSource();
   src.buffer = buffer;
-  src.connect(playbackCtx.destination);
+  src.connect(playbackGainNode || playbackCtx.destination);
 
   src.onended = () => {
     activeSources = activeSources.filter((s) => s !== src);
@@ -522,12 +771,19 @@ async function ensureNavTtsWs() {
 
       if (msg.type === 'audio') {
         const u8 = b64ToU8(msg.data_b64 || '');
+        updateUIState(AgentState.SPEAKING);
         enqueuePcmForPlayback(u8);
         return;
       }
 
       if (msg.type === 'interrupted') {
+        updateUIState(AgentState.LISTENING);
         stopPlayback();
+        return;
+      }
+
+      if (msg.type === 'turn_complete') {
+        updateUIState(AgentState.LISTENING);
         return;
       }
     } catch {
@@ -673,6 +929,12 @@ async function liveSttOnce() {
       const t = performance.now();
       const speakingNow = level >= STT_SPEECH_RMS;
 
+      // Auto barge-in for Navigator pages.
+      const didInterrupt = handleMicFrameForBargeIn(down, navTtsWs, 'nav-barge-in');
+      if (didInterrupt && navWs && navWs.readyState === WebSocket.OPEN) {
+        try { navWs.send(JSON.stringify({ type: 'interrupt' })); } catch {}
+      }
+
       if (speakingNow) {
         navSttLastVoiceMs = t;
         navSttInUtterance = true;
@@ -799,6 +1061,7 @@ async function ensureWs() {
 
   ws.onclose = (evt) => {
     setStatus('disconnected', true);
+    updateUIState(AgentState.IDLE);
     log(`WS closed code=${evt.code} reason=${evt.reason || '(none)'}`);
   };
 
@@ -828,6 +1091,7 @@ async function ensureWs() {
         if (msg.reason) extra.push(`reason=${msg.reason}`);
         if (msg.detail) extra.push(`detail=${msg.detail}`);
         log(`status: ${msg.status} model=${msg.model || ''} vision=${msg.vision} output=${msg.output}${extra.length ? ' ' + extra.join(' ') : ''}`);
+        interruptDebug({ status: msg.status, reason: msg.reason || '', detail: msg.detail || '' }, 'ws_status');
         if (msg.status === 'restarting') {
           suppressOutputUntilConnected = true;
           stopPlayback();
@@ -850,14 +1114,16 @@ async function ensureWs() {
 
       if (msg.type === 'text') {
         if (suppressOutputUntilConnected) return;
-        setState('speaking');
+        updateUIState(AgentState.SPEAKING);
+        lastServerOutputAt = performance.now();
         appendTranscript(msg.text || '');
         return;
       }
 
       if (msg.type === 'transcript') {
         if (suppressOutputUntilConnected) return;
-        setState('speaking');
+        updateUIState(AgentState.SPEAKING);
+        lastServerOutputAt = performance.now();
         if (typeof msg.text === 'string') appendTranscript(msg.text);
         if (msg.finished) appendTranscript('\n');
         return;
@@ -865,7 +1131,8 @@ async function ensureWs() {
 
       if (msg.type === 'audio') {
         if (suppressOutputUntilConnected) return;
-        setState('speaking');
+        updateUIState(AgentState.SPEAKING);
+        lastServerOutputAt = performance.now();
         const u8 = b64ToU8(msg.data_b64 || '');
         enqueuePcmForPlayback(u8);
         return;
@@ -874,13 +1141,14 @@ async function ensureWs() {
       if (msg.type === 'interrupted') {
         log(`server reports interrupted${msg.source ? ` source=${msg.source}` : ''}`);
         suppressOutputUntilConnected = true;
-        setState('interrupted');
+        updateUIState(AgentState.LISTENING);
         stopPlayback();
         return;
       }
 
       if (msg.type === 'turn_complete') {
         appendTranscript('\n');
+        updateUIState(AgentState.LISTENING);
         // Don't flip to listening until queued audio finished playing.
         pendingTurnComplete = true;
         maybeSetStateAfterPlayback();
@@ -906,6 +1174,7 @@ async function startMic() {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
+      channelCount: 1,
     },
   });
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -919,6 +1188,9 @@ async function startMic() {
     const input = e.inputBuffer.getChannelData(0);
     const down = downsampleBuffer(input, audioCtx.sampleRate, TARGET_INPUT_SAMPLE_RATE);
 
+    // Always evaluate barge-in on every frame while model audio may be active.
+    handleMicFrameForBargeIn(down, ws, 'barge-in');
+
     // VAD: only stream frames when we believe the user is speaking. When we detect
     // enough silence after speech, send audio_end to close the utterance.
     const level = rms(down);
@@ -927,18 +1199,6 @@ async function startMic() {
 
     if (speakingNow) {
       lastVoiceMs = t;
-
-      // Barge-in: only interrupt if we see sustained, loud-enough speech while the model is speaking.
-      if (currentState === 'speaking' || isAudioPlayingOrQueued()) {
-        if (level >= BARGE_IN_RMS) bargeInFrames++;
-        else bargeInFrames = 0;
-        if (bargeInFrames >= BARGE_IN_FRAMES) {
-          bargeInFrames = 0;
-          maybeSendBargeInInterrupt();
-        }
-      } else {
-        bargeInFrames = 0;
-      }
 
       inUtterance = true;
       setState('listening');
@@ -951,7 +1211,7 @@ async function startMic() {
         // ignore
       }
       inUtterance = false;
-      bargeInFrames = 0;
+      vadActiveMs = 0;
       return;
     }
 
@@ -978,7 +1238,7 @@ async function startMic() {
   startBtn.disabled = true;
   stopBtn.disabled = false;
   log('Mic started');
-  setState('listening');
+  updateUIState(AgentState.LISTENING);
 }
 
 async function stopMic() {
@@ -1027,62 +1287,75 @@ async function stopMic() {
   }
 }
 
-startBtn.addEventListener('click', async () => {
-  try {
-    await startMic();
-  } catch (e) {
-    log(`Start failed: ${e?.message || e}`);
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+if (HAS_LIVE_AGENT_UI) {
+  ensureInterruptDebugPanel();
+  startBtn.addEventListener('click', async () => {
+    try {
+      await startMic();
+    } catch (e) {
+      log(`Start failed: ${e?.message || e}`);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    await stopMic();
+  });
+
+  if (uploadImgBtn && imageFileEl) {
+    uploadImgBtn.addEventListener('click', () => {
+      imageFileEl.value = '';
+      imageFileEl.click();
+    });
+
+    imageFileEl.addEventListener('change', async () => {
+      const file = imageFileEl.files && imageFileEl.files[0];
+      const promptEl = document.getElementById('visionPrompt');
+      const prompt = promptEl && promptEl.value ? String(promptEl.value).trim() : '';
+      await sendVisionImage(file, prompt || 'What am I looking at?');
+    });
   }
-});
 
-stopBtn.addEventListener('click', async () => {
-  await stopMic();
-});
+  wsUrlEl.textContent = buildWsUrl();
+  setStatus('disconnected', true);
+  setState('idle');
+  log('Ready');
+}
 
-uploadImgBtn.addEventListener('click', () => {
-  imageFileEl.value = '';
-  imageFileEl.click();
-});
+if (HAS_UI_NAVIGATOR_UI) {
+  ensureInterruptDebugPanel();
+  navWsUrlEl.textContent = buildNavWsUrl();
+  // Reuse shared log/status elements if present; otherwise navigator still works.
+  log('NAV: Ready');
 
-imageFileEl.addEventListener('change', async () => {
-  const file = imageFileEl.files && imageFileEl.files[0];
-  await sendVisionImage(file, 'What am I looking at?');
-});
-
-wsUrlEl.textContent = buildWsUrl();
-navWsUrlEl.textContent = buildNavWsUrl();
-setStatus('disconnected', true);
-setState('idle');
-log('Ready');
-
-navOpenBtn.addEventListener('click', async () => {
-  await ensureNavWs();
-  let url = (navUrlEl.value || '').trim();
-  if (!url) {
-    log('NAV: missing URL');
-    return;
-  }
-  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-  navWs.send(JSON.stringify({ type: 'open', url }));
-});
-
-navRunBtn.addEventListener('click', async () => {
-  await ensureNavWs();
-  const text = (navTaskEl.value || '').trim();
-  if (!text) {
-    log('NAV: missing task');
-    return;
-  }
-  // Demo-friendly: if a URL is present, open it first so we don't plan against about:blank.
-  let url = (navUrlEl.value || '').trim();
-  if (url) {
+  navOpenBtn.addEventListener('click', async () => {
+    await ensureNavWs();
+    let url = (navUrlEl.value || '').trim();
+    if (!url) {
+      log('NAV: missing URL');
+      return;
+    }
     if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
     navWs.send(JSON.stringify({ type: 'open', url }));
-  }
-  navWs.send(JSON.stringify({ type: 'task', text }));
-});
+  });
+
+  navRunBtn.addEventListener('click', async () => {
+    await ensureNavWs();
+    const text = (navTaskEl.value || '').trim();
+    if (!text) {
+      log('NAV: missing task');
+      return;
+    }
+    // Demo-friendly: if a URL is present, open it first so we don't plan against about:blank.
+    let url = (navUrlEl.value || '').trim();
+    if (url) {
+      if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+      navWs.send(JSON.stringify({ type: 'open', url }));
+    }
+    navWs.send(JSON.stringify({ type: 'task', text }));
+  });
+}
 
 function getSpeechRecognition() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
@@ -1153,11 +1426,13 @@ async function speakTaskOnce() {
   }
 }
 
-navSpeakBtn.addEventListener('click', async () => {
-  await speakTaskOnce();
-});
+if (HAS_UI_NAVIGATOR_UI) {
+  navSpeakBtn.addEventListener('click', async () => {
+    await speakTaskOnce();
+  });
 
-navInterruptBtn.addEventListener('click', async () => {
-  await ensureNavWs();
-  navWs.send(JSON.stringify({ type: 'interrupt' }));
-});
+  navInterruptBtn.addEventListener('click', async () => {
+    await ensureNavWs();
+    navWs.send(JSON.stringify({ type: 'interrupt' }));
+  });
+}

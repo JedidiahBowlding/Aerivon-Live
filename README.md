@@ -72,6 +72,12 @@ curl http://localhost:8080/agent/security-check
 curl http://localhost:8080/agent/self-test
 curl http://localhost:8080/agent/architecture
 
+# Streaming (SSE)
+
+curl -N -X POST http://localhost:8080/agent/message-stream \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"demo","message":"Say hello in 3 short chunks."}'
+
 # Real-time (Live Agents)
 
 Aerivon Live exposes a real-time WebSocket for Live Agents demos:
@@ -100,6 +106,16 @@ Server streams:
 - `{ "type": "turn_complete" }`
 
 Tip: keep audio chunks small (e.g. 50–200KB base64 per frame).
+
+### Persistent memory (Firestore)
+
+If you prefer Firestore for per-user conversation memory, set:
+
+```bash
+export AERIVON_FIRESTORE_COLLECTION="aerivon_memory"
+```
+
+When `AERIVON_FIRESTORE_COLLECTION` is set it takes precedence over `AERIVON_MEMORY_BUCKET`.
 
 ### Realtime vision model
 

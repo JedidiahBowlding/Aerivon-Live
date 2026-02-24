@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
@@ -26,9 +28,30 @@ from gemini_client import check_live_model_availability, resolve_fallback_model
 
 
 app = FastAPI(title="Aerivon Live Agent API")
+
+# CORS: allow the demo frontend (served on a different port) to call the backend.
+_cors_origins_env = (os.getenv("AERIVON_CORS_ORIGINS") or "").strip()
+if _cors_origins_env:
+    cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+else:
+    cors_origins = [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 agent: AerivonLiveAgent | None = None
 SESSION_TOOL_RESULTS: dict[str, list[dict[str, Any]]] = {}
 LAST_REQUEST_TIME: dict[str, float] = {}
+
+# Active SSE streams per user (used for server-side interruption on new request).
+ACTIVE_SSE_CANCEL: dict[str, asyncio.Event] = {}
 
 MAX_MESSAGE_LENGTH = 4000
 MAX_SESSION_RESULTS = 100
@@ -36,6 +59,32 @@ RATE_LIMIT_SECONDS = 1.0
 MAX_RESULT_SIZE = 20000
 MAX_WS_MESSAGE_BYTES = 256 * 1024
 DEFAULT_LIVE_AUDIO_SAMPLE_RATE = int(os.getenv("AERIVON_LIVE_AUDIO_SAMPLE_RATE", "24000"))
+
+API_KEY_ENV_VARS = ("GOOGLE_CLOUD_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+
+def _get_api_key() -> str | None:
+    for name in API_KEY_ENV_VARS:
+        val = (os.getenv(name) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def _make_genai_client(*, prefer_vertex: bool, project: str | None, location: str) -> genai.Client:
+    http_options = HttpOptions(api_version="v1beta1")
+    if prefer_vertex and project:
+        return genai.Client(vertexai=True, project=project, location=location, http_options=http_options)
+
+    api_key = _get_api_key()
+    if api_key:
+        return genai.Client(api_key=api_key, http_options=http_options)
+
+    # No credentials configured.
+    raise ValueError(
+        "Missing credentials. Set GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT (and ADC), "
+        "or set an API key env var (GEMINI_API_KEY / GOOGLE_API_KEY / GOOGLE_CLOUD_API_KEY)."
+    )
 
 # Live generation tuning. Live sessions can default to relatively small output budgets unless specified.
 # Bump the default so audio replies are less likely to stop mid-sentence.
@@ -46,6 +95,10 @@ AERIVON_LIVE_TEMPERATURE = float(os.getenv("AERIVON_LIVE_TEMPERATURE", "0.7"))
 AERIVON_MEMORY_BUCKET = os.getenv("AERIVON_MEMORY_BUCKET", "").strip()
 AERIVON_MEMORY_PREFIX = os.getenv("AERIVON_MEMORY_PREFIX", "memory/").strip() or "memory/"
 AERIVON_MEMORY_MAX_EXCHANGES = int(os.getenv("AERIVON_MEMORY_MAX_EXCHANGES", "6"))
+
+# Persistent memory (optional): Firestore document per user.
+# If set, Firestore takes precedence over GCS for memory I/O.
+AERIVON_FIRESTORE_COLLECTION = os.getenv("AERIVON_FIRESTORE_COLLECTION", "").strip()
 
 UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
 UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-2.0-flash").strip()
@@ -92,12 +145,31 @@ def _memory_blob_name(user_id: str) -> str:
 
 
 async def _load_user_memory(*, user_id: str) -> dict[str, Any] | None:
+    if AERIVON_FIRESTORE_COLLECTION:
+        def _load_fs() -> dict[str, Any] | None:
+            try:
+                from google.cloud import firestore  # type: ignore
+            except Exception:
+                return None
+
+            client = firestore.Client()
+            doc = client.collection(AERIVON_FIRESTORE_COLLECTION).document(user_id).get()
+            if not doc.exists:
+                return None
+            data = doc.to_dict() or {}
+            return data if isinstance(data, dict) else None
+
+        try:
+            return await asyncio.to_thread(_load_fs)
+        except Exception:
+            return None
+
     if not AERIVON_MEMORY_BUCKET:
         return None
 
     blob_name = _memory_blob_name(user_id)
 
-    def _load() -> dict[str, Any] | None:
+    def _load_gcs() -> dict[str, Any] | None:
         client = storage.Client()
         bucket = client.bucket(AERIVON_MEMORY_BUCKET)
         blob = bucket.blob(blob_name)
@@ -110,18 +182,37 @@ async def _load_user_memory(*, user_id: str) -> dict[str, Any] | None:
         return data
 
     try:
-        return await asyncio.to_thread(_load)
+        return await asyncio.to_thread(_load_gcs)
     except Exception:
         return None
 
 
 async def _save_user_memory(*, user_id: str, memory: dict[str, Any]) -> None:
+    if AERIVON_FIRESTORE_COLLECTION:
+        def _save_fs() -> None:
+            try:
+                from google.cloud import firestore  # type: ignore
+            except Exception:
+                return
+
+            client = firestore.Client()
+            client.collection(AERIVON_FIRESTORE_COLLECTION).document(user_id).set(
+                memory,
+                merge=True,
+            )
+
+        try:
+            await asyncio.to_thread(_save_fs)
+        except Exception:
+            return
+        return
+
     if not AERIVON_MEMORY_BUCKET:
         return
 
     blob_name = _memory_blob_name(user_id)
 
-    def _save() -> None:
+    def _save_gcs() -> None:
         client = storage.Client()
         bucket = client.bucket(AERIVON_MEMORY_BUCKET)
         blob = bucket.blob(blob_name)
@@ -131,10 +222,36 @@ async def _save_user_memory(*, user_id: str, memory: dict[str, Any]) -> None:
         )
 
     try:
-        await asyncio.to_thread(_save)
+        await asyncio.to_thread(_save_gcs)
     except Exception:
-        # Best-effort only.
         return
+
+
+async def _append_exchange_to_memory(*, user_id: str, user_text: str, model_text: str) -> None:
+    if not (AERIVON_FIRESTORE_COLLECTION or AERIVON_MEMORY_BUCKET):
+        return
+
+    mem = await _load_user_memory(user_id=user_id) or {}
+    exchanges = mem.get("exchanges")
+    if not isinstance(exchanges, list):
+        exchanges = []
+
+    exchanges.append(
+        {
+            "t": int(time.time()),
+            "user": (user_text or "").strip()[:2000],
+            "model": (model_text or "").strip()[:4000],
+        }
+    )
+    exchanges = exchanges[-AERIVON_MEMORY_MAX_EXCHANGES :]
+    mem["user_id"] = user_id
+    mem["updated_at"] = int(time.time())
+    mem["exchanges"] = exchanges
+    joined = " ".join(
+        [f"U:{ex.get('user','')} M:{ex.get('model','')}" for ex in exchanges if isinstance(ex, dict)]
+    )
+    mem["summary"] = joined[:1200]
+    await _save_user_memory(user_id=user_id, memory=mem)
 
 
 def _memory_to_prompt(memory: dict[str, Any] | None) -> str:
@@ -491,6 +608,7 @@ async def ws_ui(websocket: WebSocket) -> None:
 
 
 class AgentMessageRequest(BaseModel):
+    user_id: str | None = None
     message: str = Field(min_length=1)
 
 
@@ -504,6 +622,12 @@ class ToolResultRequest(BaseModel):
     tool_name: str
     tool_call_id: str | None = None
     result: dict[str, Any]
+
+
+class SpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    lang: str | None = None
+    voice: str | None = None
 
 
 @app.get("/health")
@@ -564,12 +688,59 @@ async def security_check() -> dict[str, Any]:
     }
 
 
+@app.post("/agent/speak")
+async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
+    """Synthesize speech as MP3 using Google Cloud Text-to-Speech.
+
+    This is used by the Translator demo to provide voice output even when
+    Gemini Live audio output isn't available.
+    """
+
+    try:
+        from google.cloud import texttospeech  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Text-to-Speech unavailable: {exc}")
+
+    lang = (payload.lang or os.getenv("AERIVON_TTS_LANG") or "en-US").strip() or "en-US"
+    voice_name = (payload.voice or os.getenv("AERIVON_TTS_VOICE") or "").strip()
+    text = payload.text.strip()
+
+    def _synth() -> bytes:
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=lang,
+            name=voice_name if voice_name else None,
+        )
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+        resp = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        return bytes(resp.audio_content or b"")
+
+    try:
+        audio = await asyncio.to_thread(_synth)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not audio:
+        raise HTTPException(status_code=500, detail="No audio returned")
+
+    async def body():
+        yield audio
+
+    return StreamingResponse(body(), media_type="audio/mpeg")
+
+
 @app.get("/agent/architecture")
 async def architecture() -> dict[str, Any]:
     return {
         "agent": "Aerivon Live",
         "entrypoints": [
             {"method": "POST", "path": "/agent/message"},
+            {"method": "POST", "path": "/agent/message-stream"},
             {"method": "POST", "path": "/agent/tool-result"},
             {"method": "WS", "path": "/ws/live"},
         ],
@@ -616,10 +787,8 @@ async def ws_live(websocket: WebSocket) -> None:
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
     location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
-    if not use_vertex or not project:
-        await websocket.send_json({"type": "error", "error": "Vertex Live not enabled"})
-        await websocket.close(code=1011)
-        return
+    vertex_live_enabled = bool(use_vertex and project)
+    # If Vertex Live isn't configured, this WS will fall back to standard generation.
 
     # Do NOT pre-probe models.list() here; it can hang. We'll attempt a Live connect and if that
     # fails we'll fall back to standard generation.
@@ -651,7 +820,12 @@ async def ws_live(websocket: WebSocket) -> None:
 
     model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
 
-    client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+    try:
+        client = _make_genai_client(prefer_vertex=vertex_live_enabled, project=project, location=location)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "error": str(exc)})
+        await websocket.close(code=1011)
+        return
 
     voice_name = (websocket.query_params.get("voice") or os.getenv("AERIVON_LIVE_VOICE") or "").strip()
     voice_lang = (websocket.query_params.get("lang") or os.getenv("AERIVON_LIVE_VOICE_LANG") or "en-US").strip()
@@ -714,6 +888,18 @@ async def ws_live(websocket: WebSocket) -> None:
 
     session_seq = 0
 
+    def _is_ws_closed_error(exc: Exception) -> bool:
+        if isinstance(exc, WebSocketDisconnect):
+            return True
+        msg = str(exc)
+        return (
+            "Cannot call \"send\" once a close message has been sent." in msg
+            or "Unexpected ASGI message 'websocket.send'" in msg
+            or "Unexpected ASGI message 'websocket.close'" in msg
+            or "after sending 'websocket.close'" in msg
+            or "response already completed" in msg
+        )
+
     def _pcm_s16le_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
         import struct
 
@@ -750,11 +936,19 @@ async def ws_live(websocket: WebSocket) -> None:
 
         async def ws_send(payload: dict[str, Any]) -> None:
             payload.setdefault("session_id", session_id)
-            await websocket.send_json(payload)
+            try:
+                await websocket.send_json(payload)
+            except Exception as exc:
+                if _is_ws_closed_error(exc):
+                    raise WebSocketDisconnect(code=1006)
+                raise
 
-        # Pick a standard model available in this project.
-        preferred = os.getenv("AERIVON_WS_FALLBACK_MODEL", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"))
-        fallback_model = resolve_fallback_model(project, location, preferred)
+        # Pick a standard model. If we don't have a Vertex project, skip model listing.
+        preferred = os.getenv(
+            "AERIVON_WS_FALLBACK_MODEL",
+            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"),
+        )
+        fallback_model = resolve_fallback_model(project, location, preferred) if project else preferred
 
         await ws_send(
             {
@@ -923,7 +1117,12 @@ async def ws_live(websocket: WebSocket) -> None:
 
         async def ws_send(payload: dict[str, Any]) -> None:
             payload.setdefault("session_id", session_id)
-            await websocket.send_json(payload)
+            try:
+                await websocket.send_json(payload)
+            except Exception as exc:
+                if _is_ws_closed_error(exc):
+                    raise WebSocketDisconnect(code=1006)
+                raise
 
         # Turn buffers for persistent memory.
         last_user_for_memory: str = ""
@@ -1203,9 +1402,16 @@ async def ws_live(websocket: WebSocket) -> None:
                         pass
 
     try:
+        # Without Vertex Live, don't attempt live.connect (it will fail with API-key clients).
+        if not vertex_live_enabled:
+            await run_fallback_session()
+            return
+
         while True:
             try:
                 should_restart = await run_one_session()
+            except WebSocketDisconnect:
+                return
             except Exception:
                 # Live connect/runtime failed; fall back to standard generation so the client
                 # still gets a response.
@@ -1220,8 +1426,12 @@ async def ws_live(websocket: WebSocket) -> None:
         # Best effort: report the error then close.
         try:
             await websocket.send_json({"type": "error", "error": str(exc)})
-        finally:
+        except Exception:
+            pass
+        try:
             await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 @app.get("/agent/self-test")
@@ -1308,21 +1518,207 @@ async def post_agent_message(payload: AgentMessageRequest, request: Request) -> 
     if _contains_unsafe_target(payload.message):
         raise HTTPException(status_code=400, detail="Blocked unsafe host")
 
-    session_id = "default"
+    user_id = _sanitize_user_id(payload.user_id or client_ip)
+    session_id = user_id
     SESSION_TOOL_RESULTS.setdefault(session_id, [])
 
+    user_memory = await _load_user_memory(user_id=user_id)
+    memory_prompt = _memory_to_prompt(user_memory)
+    message = payload.message
+    if memory_prompt:
+        message = f"{memory_prompt}\n\nUser: {payload.message}".strip()
+
     try:
-        turn = await _get_agent().process_message(payload.message)
+        turn = await _get_agent().process_message(message)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     SESSION_TOOL_RESULTS[session_id].extend(turn.tool_calls)
     SESSION_TOOL_RESULTS[session_id] = SESSION_TOOL_RESULTS[session_id][-MAX_SESSION_RESULTS:]
 
+    await _append_exchange_to_memory(user_id=user_id, user_text=payload.message, model_text=turn.response_text)
+
     return AgentMessageResponse(
         response=turn.response_text,
         tool_calls=turn.tool_calls,
     )
+
+
+@app.post("/agent/message-stream")
+async def post_agent_message_stream(payload: AgentMessageRequest, request: Request) -> StreamingResponse:
+    """Stream a text response via Server-Sent Events (SSE).
+
+    This is designed for hackathon demos where the client wants streaming text output
+    and interruption via starting a new stream for the same user_id.
+    """
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    last_seen = LAST_REQUEST_TIME.get(client_ip)
+    if last_seen is not None and now - last_seen < RATE_LIMIT_SECONDS:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    LAST_REQUEST_TIME[client_ip] = now
+
+    if len(payload.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=413, detail="Message too long")
+
+    lowered = payload.message.lower()
+    if any(pattern in lowered for pattern in INJECTION_PATTERNS):
+        raise HTTPException(status_code=400, detail="Message rejected by security policy")
+
+    if _contains_unsafe_target(payload.message):
+        raise HTTPException(status_code=400, detail="Blocked unsafe host")
+
+    user_id = _sanitize_user_id(payload.user_id or client_ip)
+
+    # Server-side interruption: cancel any prior stream for this user.
+    prev = ACTIVE_SSE_CANCEL.get(user_id)
+    if prev is not None:
+        prev.set()
+    cancel_event = asyncio.Event()
+    ACTIVE_SSE_CANCEL[user_id] = cancel_event
+
+    async def event_iter():
+        def sse(event: str, data: dict[str, Any]) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        user_memory = await _load_user_memory(user_id=user_id)
+        memory_prompt = _memory_to_prompt(user_memory)
+
+        system_instruction = "You are Aerivon Live. Be concise and helpful."
+        if memory_prompt:
+            system_instruction = f"{system_instruction}\n\n{memory_prompt}"
+
+        use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+        project = os.getenv("GOOGLE_CLOUD_PROJECT")
+        location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        prefer_vertex = bool(use_vertex and project)
+
+        # For SSE text streaming, use standard generate_content_stream (not Live).
+        preferred_model = (
+            os.getenv("AERIVON_SSE_MODEL")
+            or os.getenv("GEMINI_FALLBACK_MODEL")
+            or os.getenv("AERIVON_WS_FALLBACK_MODEL")
+            or "gemini-2.5-flash"
+        ).strip()
+        model = resolve_fallback_model(project, location, preferred_model) if project else preferred_model
+
+        try:
+            client = _make_genai_client(prefer_vertex=prefer_vertex, project=project, location=location)
+        except Exception as exc:
+            yield sse("error", {"type": "error", "error": str(exc)})
+            yield sse("done", {"type": "done"})
+            return
+
+        # Yield an initial status event so the client can update UI immediately.
+        yield sse(
+            "status",
+            {
+                "type": "status",
+                "status": "connected",
+                "user_id": user_id,
+                "model": model,
+            },
+        )
+
+        text_parts: list[str] = []
+        interrupted = False
+
+        import threading
+
+        stop_flag = threading.Event()
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _extract_text_from_response(resp: Any) -> str:
+            try:
+                cands = getattr(resp, "candidates", None) or []
+                cand = cands[0] if cands else None
+                content = getattr(cand, "content", None) if cand is not None else None
+                parts = getattr(content, "parts", None) if content is not None else None
+                if not parts:
+                    return ""
+                return "".join([p.text for p in parts if getattr(p, "text", None)])
+            except Exception:
+                return ""
+
+        def _run_stream() -> None:
+            try:
+                stream_fn = getattr(client.models, "generate_content_stream", None)
+                if stream_fn is None:
+                    # No streaming API available; fall back to one-shot.
+                    resp = client.models.generate_content(
+                        model=model,
+                        contents=[types.Content(role="user", parts=[types.Part.from_text(text=payload.message)])],
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            max_output_tokens=AERIVON_LIVE_MAX_OUTPUT_TOKENS,
+                            temperature=AERIVON_LIVE_TEMPERATURE,
+                        ),
+                    )
+                    text = _extract_text_from_response(resp)
+                    if text:
+                        asyncio.run_coroutine_threadsafe(q.put(text), loop)
+                    return
+
+                for resp in stream_fn(
+                    model=model,
+                    contents=[types.Content(role="user", parts=[types.Part.from_text(text=payload.message)])],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        max_output_tokens=AERIVON_LIVE_MAX_OUTPUT_TOKENS,
+                        temperature=AERIVON_LIVE_TEMPERATURE,
+                    ),
+                ):
+                    if stop_flag.is_set():
+                        break
+                    text = _extract_text_from_response(resp)
+                    if text:
+                        asyncio.run_coroutine_threadsafe(q.put(text), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+        prod_task = asyncio.create_task(asyncio.to_thread(_run_stream))
+
+        try:
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        stop_flag.set()
+                        interrupted = True
+                        yield sse("interrupted", {"type": "interrupted", "source": "new_request"})
+                        break
+
+                    item = await q.get()
+                    if item is None:
+                        break
+                    text_parts.append(item)
+                    yield sse("text", {"type": "text", "text": item})
+            finally:
+                stop_flag.set()
+                try:
+                    await asyncio.wait_for(prod_task, timeout=1.0)
+                except Exception:
+                    pass
+        except Exception as exc:
+            yield sse("error", {"type": "error", "error": str(exc)})
+        finally:
+            # Only persist full exchange if we completed normally.
+            if not interrupted:
+                await _append_exchange_to_memory(
+                    user_id=user_id,
+                    user_text=payload.message,
+                    model_text="".join(text_parts),
+                )
+
+            # Clean up cancel registry if we're still the active stream.
+            current = ACTIVE_SSE_CANCEL.get(user_id)
+            if current is cancel_event:
+                ACTIVE_SSE_CANCEL.pop(user_id, None)
+
+            yield sse("done", {"type": "done"})
+
+    return StreamingResponse(event_iter(), media_type="text/event-stream")
 
 
 @app.post("/agent/tool-result")

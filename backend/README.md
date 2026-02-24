@@ -43,6 +43,16 @@ curl -X POST http://localhost:8080/agent/message \
   -H "Content-Type: application/json" \
   -d '{"message":"Find dentists in Miami and generate outreach message"}'
 
+## Streaming (SSE)
+
+Stream a text response via Server-Sent Events (SSE):
+
+```bash
+curl -N -X POST http://localhost:8080/agent/message-stream \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"demo","message":"Explain what you can do, one sentence at a time."}'
+```
+
 ## Audio output (TTS)
 
 ```bash
@@ -132,3 +142,9 @@ Cloud Run should use the attached service account automatically. Do not ship cre
 ## Architecture diagram
 
 See ARCHITECTURE.md.
+
+## Persistent memory backend
+
+- Default: none (unless you set one of the options below)
+- GCS: set `AERIVON_MEMORY_BUCKET`
+- Firestore: set `AERIVON_FIRESTORE_COLLECTION` (takes precedence over GCS)

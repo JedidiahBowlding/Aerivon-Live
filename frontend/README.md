@@ -1,6 +1,6 @@
-# Aerivon Live – Minimal WebSocket Microphone Client
+# Aerivon Live – Demo Frontend (Multi-page)
 
-This is a minimal browser client for Aerivon Live `WS /ws/live`.
+This frontend serves separate pages for each demo feature (Live Agent, Translator, Vision Tutor, Customer Support, UI Navigator variants).
 
 ## Run
 
@@ -25,6 +25,16 @@ python3 -m http.server 5173
 
 - <http://localhost:5173>
 
+Pages:
+
+- `/live_agent.html`
+- `/translator.html`
+- `/vision_tutor.html`
+- `/customer_support.html`
+- `/ui_navigator.html`
+- `/workflow_automator.html`
+- `/visual_qa.html`
+
 ### Connect to Cloud Run backend
 
 If your backend is deployed to Cloud Run, serve the frontend locally and pass the backend base URL:
@@ -33,7 +43,7 @@ Example:
 
 `http://localhost:5173/?backend=https://aerivon-live-agent-yt33hll5ka-uc.a.run.app`
 
-Click **Start** to stream microphone audio to Live over WebSocket and play back the model audio output.
+Click **Start** (where available) to stream microphone audio to Live over WebSocket and play back the model audio output.
 
 ## Demo scenario (3 minutes)
 

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aerivon Live – Customer Support</title>
+    <link rel="icon" href="./assets/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="./assets/favicon-96x96.png" sizes="96x96" />
+    <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
+    <link rel="manifest" href="./assets/site.webmanifest" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+      .logo { width: 36px; height: 36px; border-radius: 8px; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      input, textarea { padding: 10px 12px; }
+      button { padding: 10px 14px; }
+      .muted { color: #666; }
+      #agentState { display: inline-block; }
+      .state-idle { color: #00c853; }
+      .state-speaking { color: #2962ff; }
+      .state-interrupted { color: #ff6d00; }
+      .pulse-once { animation: pulse 0.4s ease-out; }
+      @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.08); }
+        100% { transform: scale(1); }
+      }
+      .spacer { height: 14px; }
+      #output, #log { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; }
+      #output { min-height: 140px; }
+      #log { min-height: 90px; color: #333; }
+      code { background: #f6f8fa; padding: 2px 6px; border-radius: 6px; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
+      <h1 style="margin: 0">Customer Support Agent</h1>
+      <span class="muted"><a href="./index.html">Home</a></span>
+    </div>
+
+    <p class="muted" style="margin-top: 6px">
+      Streaming chat + per-user memory (Firestore or GCS). Use the same <code>user_id</code> to keep context across turns.
+    </p>
+
+    <div class="row">
+      <label class="muted">Backend: <code id="backendBase"></code></label>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="row">
+      <input id="userId" type="text" value="support_demo" style="min-width: 240px" />
+      <button id="stopBtn">⏹ Stop</button>
+      <span class="muted">State: <strong id="agentState">IDLE</strong></span>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="row" style="align-items: flex-start">
+      <textarea id="message" rows="3" style="min-width: 720px" placeholder="Why was my order cancelled?">Why was my order cancelled?</textarea>
+      <button id="sendBtn">Send (⌘/Ctrl+Enter)</button>
+    </div>
+
+    <div class="spacer"></div>
+
+    <h3>Stream</h3>
+    <div id="output"></div>
+
+    <div class="spacer"></div>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script src="./sse_chat.js"></script>
+  </body>
+</html>
