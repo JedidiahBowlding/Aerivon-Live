@@ -1,150 +1,130 @@
-# Aerivon Live (Hackathon Backend)
+# Aerivon Live Agent (Backend)
 
-Aerivon Live is a secure autonomous business agent backend built on FastAPI and Gemini (Vertex AI). It supports tool calling, browsing with Playwright, lead scraping, outreach message generation, and layered defenses against prompt injection, SSRF, and runaway costs.
+FastAPI backend for Aerivon Live Agent using Gemini 2.0 Flash Live API (preview-04-09) via Vertex AI. Features real-time duplex audio streaming, interrupt handling, persistent memory via GCS, and automatic upstream disconnect recovery.
 
-## Why this is hackathon-ready
+## Why Hackathon-Ready
 
-- Gemini on Vertex AI (ADC auth) with automatic **Live → standard Gemini fallback**
-- Tool calling with allowlist + argument validation + relevance gating
-- SSRF protections (blocks localhost, metadata endpoints, private IPs)
-- Prompt injection protection at API + agent + model-instruction layers
-- Cost controls: per-turn timeout, per-turn tool-call cap, rate limiting
-- Verification endpoints for judges: `/health`, `/agent/startup-check`, `/agent/security-check`, `/agent/self-test`, `/agent/architecture`
+- **Gemini 2.0 Flash Live** multimodal API with streaming audio/text
+- **Handles interruptions gracefully** - key requirement for "Live Agents 🗣️" category
+- **Persistent memory** - conversation context preserved across network disconnects
+- **WebSocket duplex audio** - real-time bidirectional streaming
+- **Production deployed** on Google Cloud Run
+- **Auto-reconnect logic** - handles frequent upstream_disconnected events (5-15s intervals)
 
-## Quickstart (local)
+## Quick Start (Local)
 
-From this folder:
+From the repository root:
 
 ```bash
-# Recommended env vars
+./aerivon
+```
+
+Or manually from this folder:
+
+```bash
 export GOOGLE_CLOUD_PROJECT="aerivon-live-agent"
 export GOOGLE_CLOUD_LOCATION="us-central1"
+export AERIVON_MEMORY_BUCKET="aerivon-live-agent-memory-1771792693"
 
-# If running locally with a key file (DO NOT COMMIT):
-# export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
-
-uvicorn server:app --reload --app-dir . --host 127.0.0.1 --port 8080
+uvicorn server:app --host 127.0.0.1 --port 8081 --app-dir .
 ```
 
-Test endpoints:
+Test the health endpoint:
 
 ```bash
-curl http://localhost:8080/health
-curl http://localhost:8080/agent/startup-check
-curl http://localhost:8080/agent/security-check
-curl http://localhost:8080/agent/self-test
-curl http://localhost:8080/agent/architecture
+curl http://localhost:8081/health
 ```
 
-## Demo request
+## Key Endpoints
 
-```bash
-curl -X POST http://localhost:8080/agent/message \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Find dentists in Miami and generate outreach message"}'
+### `GET /health`
+Returns `ok` if Gemini Live connection is active, otherwise `live_model_unavailable` (normal when no client connected).
 
-## Streaming (SSE)
+### `WS /ws/live`
+WebSocket endpoint for real-time duplex audio streaming.
 
-Stream a text response via Server-Sent Events (SSE):
+**Query Parameters:**
+- `memory_scope` - Session identifier for persistent memory (e.g., `live_agent_{UUID}`)
 
-```bash
-curl -N -X POST http://localhost:8080/agent/message-stream \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"demo","message":"Explain what you can do, one sentence at a time."}'
+**Client → Server Messages:**
+```json
+{"type": "audio", "data": "<base64 PCM>"}
+{"type": "interrupt"}
+{"type": "text", "text": "message"}
 ```
 
-## Audio output (TTS)
-
-```bash
-curl -sS -X POST http://localhost:8080/agent/speak \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello from Aerivon Live"}' \
-  -o /tmp/aerivon_tts.mp3
-```
+**Server → Client Messages:**
+```json
+{"type": "audio", "data": "<base64 PCM>"}
+{"type": "transcript", "text": "..."}
+{"type": "status", "status": "..."}
+{"type": "turn_complete"}
 ```
 
-Note: `scrape_leads` may return a `robots.txt` block depending on the target site. This is intentional and demonstrates compliant scraping behavior.
+## Memory Architecture
 
-## Endpoints
+- **Storage**: Google Cloud Storage bucket (configurable via `AERIVON_MEMORY_BUCKET`)
+- **Scope**: Per-user sessions identified by `memory_scope` query parameter
+- **Format**: JSON array of `{user: "...", agent: "...", timestamp: "..."}` exchanges
+- **Lifecycle**: 
+  - Loaded at start of each WebSocket session
+  - Saved after each exchange (including partial exchanges before upstream disconnects)
+  - Reloaded automatically after upstream reconnects
 
-- `GET /health`
-  - Returns `ok` if Gemini Live models are available, otherwise `live_model_unavailable`.
-- `GET /agent/startup-check`
-  - Shows project/region and whether Live models are available.
-- `GET /agent/security-check`
-  - Shows active limits and security policy settings.
-- `GET /agent/self-test`
-  - Runs a lightweight self-test suite (no destructive actions).
-- `GET /agent/architecture`
-  - Returns a JSON description of the system architecture.
-- `POST /agent/message`
-  - Input: `{ "message": "..." }`
-  - Output: `{ "response": "...", "tool_calls": [...] }`
-- `POST /agent/message-multimodal`
-  - Multipart form fields: `message` (optional), `image` or `screenshot` (optional), `audio` (optional)
-  - Output: `{ "response": "...", "tool_calls": [...] }`
-- `WS /ws/live`
-  - Real-time Live Agents interface (streaming text + audio chunks)
-  - Supports interruption via `{ "type": "interrupt" }`
-  - Supports realtime vision frames via `{ "type": "image", "mime_type": "image/png", "data_b64": "..." }`
-  - Optional override: `GEMINI_LIVE_VISION_MODEL="..."`
-  - Query params:
-    - `?output=text` (default) or `?output=audio` (Live audio output + transcription)
-    - `?voice=VOICE_NAME&lang=en-US` (voice selection)
-  - Server emits `{ "type": "audio" }`, `{ "type": "transcript" }`, and `{ "type": "interrupted" }` events
-- `POST /agent/tool-result`
-  - Allows externally provided tool results to be stored (bounded by size and session caps).
+## Upstream Disconnect Handling
 
-## Security model (summary)
+The Gemini Live API frequently disconnects (every 5-15 seconds). The backend handles this gracefully:
 
-### API layer
-- Rate limiting per client IP (`RATE_LIMIT_SECONDS`)
-- Request size limits (`MAX_MESSAGE_LENGTH`, `MAX_RESULT_SIZE`)
-- Prompt-injection phrase filtering
-- SSRF pre-check to block unsafe targets before model execution
+1. Saves partial exchanges before restart
+2. Reloads memory from GCS at start of new session
+3. Rebuilds system instruction with updated conversation history
+4. Client auto-reconnects with exponential backoff (no user interruption)
 
-### Agent layer
-- Tool allowlist
-- Tool relevance gating vs explicit user intent
-- URL/tool argument validation
-- Tool output is wrapped as `untrusted_data` with a security note
-- Tool call limit per turn (max 6)
-- Turn timeout (30s)
+## Production Deployment (Cloud Run)
 
-### Tool layer
-- `is_safe_url()` blocks localhost, metadata endpoints, private ranges
-- `browse_url()` uses Playwright headless Chromium
-- `content_preview` capped to 1200 chars
-- `scrape_leads()` returns 5–10 leads (bounded)
+**Backend**: <https://aerivon-live-agent-621908229087.us-central1.run.app>  
+**Frontend**: <https://aerivon-live-frontend-621908229087.us-central1.run.app>
 
-## Deployment (Cloud Run)
-
-Build and deploy from this folder:
+Deploy updates:
 
 ```bash
-gcloud run deploy aerivon-live \
-  --source . \
+./scripts/deploy_cloud_run.sh
+```
+
+Or manually:
+
+```bash
+gcloud run deploy aerivon-live-agent \
+  --source ./backend \
   --region us-central1 \
   --allow-unauthenticated \
-  --memory 512Mi \
-  --cpu 1 \
-  --timeout 60 \
-  --max-instances 2
+  --set-env-vars AERIVON_MEMORY_BUCKET=aerivon-live-agent-memory-1771792693
 ```
 
-Cloud Run should use the attached service account automatically. Do not ship credential JSON files.
+## Architecture
 
-## Secrets
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed system architecture with Mermaid diagrams.
 
-- Service account JSON files must never be committed.
-- Root repo `.gitignore` includes `*.json` and `snark-shot-5f3a4ada1b7c.json`.
+**Key Components:**
+- FastAPI WebSocket server
+- Gemini 2.0 Flash Live client (Vertex AI SDK)
+- GCS-backed memory persistence  
+- Audio processing: PCM16 at 16kHz (input) and 24kHz (output)
+- Client-side VAD with server-side barge-in coordination
 
-## Architecture diagram
+## Development
 
-See ARCHITECTURE.md.
+**Launch script**: `./aerivon` from repo root (starts both backend and frontend)
 
-## Persistent memory backend
+**Environment Variables:**
+- `GOOGLE_CLOUD_PROJECT` - GCP project ID (required)
+- `GOOGLE_CLOUD_LOCATION` - Region for Vertex AI (default: `us-central1`)
+- `AERIVON_MEMORY_BUCKET` - GCS bucket for memory storage
+- `AERIVON_BACKEND_PORT` - Backend port (default: 8081)
+- `AERIVON_FRONTEND_PORT` - Frontend port (default: 5174)
 
-- Default: none (unless you set one of the options below)
-- GCS: set `AERIVON_MEMORY_BUCKET`
-- Firestore: set `AERIVON_FIRESTORE_COLLECTION` (takes precedence over GCS)
+**No reload mode** (for debugging):
+```bash
+export AERIVON_RELOAD=0
+./aerivon
+```

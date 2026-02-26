@@ -1,61 +1,71 @@
-# Aerivon Live – Demo Frontend (Multi-page)
+# Aerivon Live – Frontend
 
-This frontend serves separate pages for each demo feature (Live Agent, Translator, Vision Tutor, Customer Support, UI Navigator variants).
+Web interface for Aerivon Live Agent powered by Gemini 2.0 Flash Live API with real-time voice interaction, barge-in detection, and persistent memory across sessions.
 
-## Run
+## Quick Start
+
+From the repository root:
+
+```bash
+./aerivon
+```
+
+This launches both backend (port 8081) and frontend (port 5174).
+
+Open: <http://localhost:5174/live_agent.html>
+
+## Manual Setup
 
 1. Start the backend:
 
 ```bash
 cd backend
-export GOOGLE_GENAI_USE_VERTEXAI=True
 export GOOGLE_CLOUD_PROJECT="aerivon-live-agent"
-export GOOGLE_CLOUD_LOCATION="global"
-uvicorn server:app --host 127.0.0.1 --port 8080 --app-dir .
+export GOOGLE_CLOUD_LOCATION="us-central1"
+uvicorn server:app --host 127.0.0.1 --port 8081 --app-dir .
 ```
 
-1. Serve this folder:
+2. Serve this folder:
 
 ```bash
 cd frontend
-python3 -m http.server 5173
+python server.py
 ```
 
-1. Open:
+3. Open <http://localhost:5174>
 
-- <http://localhost:5173>
+## Cloud Run Deployment
 
-Pages:
+Production instance: <https://aerivon-live-frontend-621908229087.us-central1.run.app>
 
-- `/live_agent.html`
-- `/translator.html`
-- `/vision_tutor.html`
-- `/customer_support.html`
-- `/ui_navigator.html`
-- `/workflow_automator.html`
-- `/visual_qa.html`
+The frontend automatically connects to the deployed backend at:
+<https://aerivon-live-agent-621908229087.us-central1.run.app>
 
-### Connect to Cloud Run backend
+## Features
 
-If your backend is deployed to Cloud Run, serve the frontend locally and pass the backend base URL:
+- **Real-time duplex audio**: WebSocket streaming with PCM audio (16kHz)
+- **Voice Activity Detection**: Client-side VAD with dynamic noise floor learning
+- **Barge-in interrupts**: Speak over the agent to interrupt mid-response
+- **Persistent memory**: Conversation history saved to GCS, reloaded on reconnect
+- **Auto-reconnect**: Handles upstream disconnects gracefully with exponential backoff
 
-Example:
+## Demo (3-minute hackathon test)
 
-`http://localhost:5173/?backend=https://aerivon-live-agent-yt33hll5ka-uc.a.run.app`
+1. Click **Start Mic**
+2. Say: "What's the weather like in San Francisco?"
+3. While the agent responds, interrupt by saying: "Actually, tell me about Tokyo instead"
+4. Watch for the 🔴 **Interrupted** indicator
+5. Refresh the page and click **Start Mic** again - the agent remembers your conversation
 
-Click **Start** (where available) to stream microphone audio to Live over WebSocket and play back the model audio output.
+## Debug Mode
 
-## Demo scenario (3 minutes)
+Add `?debug=1` to see detailed logs in the browser console:
 
-Pick one story and run it cleanly end-to-end. This repo is currently best suited for **Voice Web Research** (no extra UI needed).
+<http://localhost:5174/live_agent.html?debug=1>
 
-1. Click **Start**.
-2. Say:
+## Architecture
 
-    “Open example.com, tell me what the page is about in one sentence, then read the title out loud.”
-
-3. While the agent is speaking, barge in (talk over it) and say:
-
-    “Stop — just tell me the title only.”
-
-Watch for the UI state badge transitions and the 🔴 **Interrupted** cue.
+- **Audio Input**: ScriptProcessor (4096 samples) → downsample 48kHz→16kHz → RMS VAD → WebSocket
+- **Audio Output**: Base64 PCM → decode → AudioBuffer → scheduled playback via AudioContext
+- **VAD Thresholds**: Speech start (0.0025 RMS), Barge-in (0.045 RMS)
+- **Memory Scope**: UUID-based session identifier sent with each connection
