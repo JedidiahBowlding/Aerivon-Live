@@ -5,6 +5,7 @@ import base64
 from datetime import datetime
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -27,6 +28,60 @@ from playwright.async_api import async_playwright
 
 from agent import AerivonLiveAgent
 from gemini_client import check_live_model_availability, resolve_fallback_model
+
+
+def retry_with_exponential_backoff(
+    func,
+    max_retries: int = 5,
+    initial_delay: float = 1.0,
+    max_delay: float = 32.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True,
+):
+    """Retry a function with exponential backoff for transient errors.
+    
+    Handles 429 RESOURCE_EXHAUSTED and other transient API errors.
+    """
+    def wrapper(*args, **kwargs):
+        retries = 0
+        delay = initial_delay
+        
+        while retries <= max_retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Check if this is a retryable error
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                is_transient = any(x in error_str for x in [
+                    "503", "500", "UNAVAILABLE", "DEADLINE_EXCEEDED"
+                ])
+                
+                if not (is_rate_limit or is_transient):
+                    # Not a retryable error, raise immediately
+                    raise
+                
+                if retries >= max_retries:
+                    print(f"[RETRY] Max retries ({max_retries}) exceeded. Giving up.", file=sys.stderr)
+                    raise
+                
+                # Calculate delay with jitter
+                wait_time = min(delay, max_delay)
+                if jitter:
+                    wait_time = wait_time * (0.5 + random.random())  # 50-150% of delay
+                
+                retries += 1
+                print(
+                    f"[RETRY] Attempt {retries}/{max_retries} failed with {type(e).__name__}. "
+                    f"Retrying in {wait_time:.1f}s...",
+                    file=sys.stderr
+                )
+                time.sleep(wait_time)
+                delay *= exponential_base
+        
+        raise Exception(f"Failed after {max_retries} retries")
+    
+    return wrapper
 
 
 app = FastAPI(title="Aerivon Live Agent API")
@@ -812,6 +867,7 @@ async def ws_story(websocket: WebSocket) -> None:
                     prefer_vertex=True, project=project, location="global"
                 )
 
+                @retry_with_exponential_backoff
                 def _run_story() -> list[dict]:
                     """Run generate_content in thread, return list of parts as dicts."""
                     print(f"[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image-preview", file=sys.stderr)
