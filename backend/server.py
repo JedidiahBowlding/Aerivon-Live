@@ -388,6 +388,8 @@ def _ui_action_prompt(task: str, memory: list[str]) -> str:
         "  \"note\": \"short explanation\"\n"
         "}\n\n"
         f"Allowed action types: {', '.join(allowed)}.\n"
+        "The browser viewport is 1366x768 pixels. Click coordinates must be within this range.\n"
+        "The screenshot you see is exactly 1366x768 - coordinates map 1:1 to the browser.\n"
         "Rules: use click x/y based on visible UI; do not invent URLs; do not access localhost/private IPs/metadata.\n"
         "If the target element isn't visible, prefer scroll then another step.\n\n"
         "Context (what has happened so far):\n"
@@ -420,7 +422,7 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
 
 
 async def _ui_screenshot_b64(page) -> tuple[str, bytes]:
-    png = await page.screenshot(full_page=True, type="png")
+    png = await page.screenshot(full_page=False, type="png")
     return base64.b64encode(png).decode("ascii"), png
 
 
@@ -448,7 +450,11 @@ async def ws_ui(websocket: WebSocket) -> None:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1366, "height": 2200})
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            java_script_enabled=True,
+            ignore_https_errors=True,
+        )
         page = await context.new_page()
 
         async def send(payload: dict[str, Any]) -> None:
@@ -464,7 +470,7 @@ async def ws_ui(websocket: WebSocket) -> None:
             await page.wait_for_timeout(800)
 
         async def execute_action(action: dict[str, Any]) -> dict[str, Any]:
-            nonlocal cancel_flag
+            nonlocal cancel_flag, page
             if cancel_flag:
                 return {"ok": False, "skipped": True, "reason": "cancelled"}
 
@@ -476,8 +482,55 @@ async def ws_ui(websocket: WebSocket) -> None:
             if t == "click":
                 x = int(action.get("x"))
                 y = int(action.get("y"))
-                await page.mouse.click(x, y)
-                await page.wait_for_timeout(500)
+                
+                import sys
+                print(f"[UI NAV DEBUG] Clicking at ({x},{y})...", file=sys.stderr, flush=True)
+                
+                # Find nearest link with proximity search
+                href = await page.evaluate(f"""() => {{
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    let best = null, bestDist = Infinity;
+                    
+                    for (const a of links) {{
+                        const r = a.getBoundingClientRect();
+                        const cx = r.left + r.width / 2;
+                        const cy = r.top + r.height / 2;
+                        const dist = Math.hypot(cx - {x}, cy - {y});
+                        
+                        if (dist < bestDist) {{
+                            bestDist = dist;
+                            best = {{ href: a.href, dist: Math.round(dist), cx: Math.round(cx), cy: Math.round(cy) }};
+                        }}
+                    }}
+                    
+                    return best;
+                }}""")
+                
+                best = href if href else {}
+                dist = best.get('dist', 999999)
+                link_href = best.get('href') if dist < 300 else None
+                print(f"[UI NAV DEBUG] Nearest link: {link_href} (dist={dist})", file=sys.stderr, flush=True)
+                
+                if link_href:
+                    await page.goto(link_href, wait_until="domcontentloaded", timeout=15000)
+                    print(f"[UI NAV DEBUG] Navigated to: {page.url}", file=sys.stderr, flush=True)
+                else:
+                    # No href found - try click then wait for navigation/new tab
+                    try:
+                        async with context.expect_page(timeout=2000) as new_page_info:
+                            await page.mouse.click(x, y)
+                        new_page = await new_page_info.value
+                        await new_page.wait_for_load_state("domcontentloaded")
+                        page = new_page
+                        print(f"[UI NAV DEBUG] New tab: {page.url}", file=sys.stderr, flush=True)
+                    except Exception as e:
+                        print(f"[UI NAV DEBUG] No new tab: {e}", file=sys.stderr, flush=True)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=3000)
+                        except Exception:
+                            await page.wait_for_timeout(1000)
+                    print(f"[UI NAV DEBUG] Final URL: {page.url}", file=sys.stderr, flush=True)
+                
                 return {"ok": True, "type": "click", "x": x, "y": y}
             if t == "type":
                 text = str(action.get("text") or "")
