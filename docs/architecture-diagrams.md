@@ -18,10 +18,10 @@ flowchart TB
     end
 
     subgraph Backend["FastAPI Backend"]
-        WS_Story[/ws/story WebSocket]
+        WS_Story["/ws/story WebSocket"]
         Story_Gen[Story Generator]
-        Save_API[POST /story/save]
-        List_API[GET /story/list]
+        Save_API["POST /story/save"]
+        List_API["GET /story/list"]
     end
 
     subgraph Gemini["Google AI"]
@@ -72,7 +72,7 @@ flowchart TB
     end
 
     subgraph Backend["FastAPI Backend"]
-        WS_Live[/ws/live WebSocket]
+        WS_Live["/ws/live WebSocket"]
         Live_Handler[Live Session Handler]
         Memory[Memory Manager]
         Audio_Proc[Audio Processor]
@@ -133,7 +133,7 @@ flowchart TB
     end
 
     subgraph Backend["FastAPI Backend"]
-        WS_UI[/ws/ui WebSocket]
+        WS_UI["/ws/ui WebSocket"]
         UI_Handler[UI Navigator Handler]
         Vision[Vision Processor]
         Executor[Action Executor]
