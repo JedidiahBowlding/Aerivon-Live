@@ -38,6 +38,24 @@
       font-style: italic;
     }
 
+    .home-link {
+      display: inline-block;
+      margin-top: 0.8rem;
+      color: #c9a84c;
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 0.4rem 0.8rem;
+      border: 1px solid rgba(201,168,76,0.3);
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+
+    .home-link:hover {
+      background: rgba(201,168,76,0.15);
+      border-color: rgba(201,168,76,0.6);
+      transform: translateY(-1px);
+    }
+
     .controls {
       display: flex;
       gap: 0.75rem;
@@ -253,6 +271,7 @@
 <header>
   <h1>✨ Aerivon Storybook</h1>
   <p>AI-narrated illustrated stories, generated in real time with Gemini multimodal</p>
+  <a href="index.html" class="home-link">← Back to Home</a>
 </header>
 
 <div class="controls">
