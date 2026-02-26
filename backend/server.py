@@ -671,6 +671,198 @@ async def ws_ui(websocket: WebSocket) -> None:
                 pass
 
 
+@app.websocket("/ws/story")
+async def ws_story(websocket: WebSocket) -> None:
+    """Interactive Storybook WS: Gemini interleaved text+image output with TTS narration.
+
+    Client messages:
+    - {"type": "prompt", "text": "Once upon a time..."}
+    - {"type": "interrupt"}
+
+    Server messages:
+    - {"type": "status", "status": "connected"|"generating"|"done"}
+    - {"type": "text", "text": "...", "index": N}          <- narration chunk
+    - {"type": "image", "data_b64": "...", "mime_type": "image/png", "index": N}
+    - {"type": "audio", "data_b64": "...", "index": N}     <- TTS for preceding text
+    - {"type": "error", "error": "..."}
+    - {"type": "done"}
+    """
+
+    await websocket.accept()
+
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+    if not use_vertex or not project:
+        await websocket.send_json({"type": "error", "error": "Vertex AI not configured"})
+        await websocket.close(code=1011)
+        return
+
+    session_id = int(time.time())
+    cancel_flag = False
+
+    async def send(payload: dict) -> None:
+        payload.setdefault("session_id", session_id)
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            pass
+
+    # TTS helper — synthesize text to MP3 bytes via Google Cloud TTS
+    async def tts_synthesize(text: str) -> bytes | None:
+        text = (text or "").strip()
+        if not text or len(text) < 3:
+            return None
+        try:
+            from google.cloud import texttospeech  # type: ignore
+
+            def _synth() -> bytes:
+                client = texttospeech.TextToSpeechClient()
+                synthesis_input = texttospeech.SynthesisInput(text=text)
+                voice = texttospeech.VoiceSelectionParams(
+                    language_code="en-US",
+                    ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+                )
+                audio_config = texttospeech.AudioConfig(
+                    audio_encoding=texttospeech.AudioEncoding.MP3
+                )
+                resp = client.synthesize_speech(
+                    input=synthesis_input, voice=voice, audio_config=audio_config
+                )
+                return bytes(resp.audio_content or b"")
+
+            return await asyncio.to_thread(_synth)
+        except Exception as e:
+            print(f"[STORY TTS] Error: {e}", file=sys.stderr)
+            return None
+
+    await send({"type": "status", "status": "connected", "model": "gemini-2.0-flash-exp"})
+
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            if not isinstance(msg, dict):
+                continue
+
+            msg_type = str(msg.get("type") or "").strip().lower()
+
+            if msg_type == "interrupt":
+                cancel_flag = True
+                await send({"type": "status", "status": "interrupted"})
+                cancel_flag = False
+                continue
+
+            if msg_type != "prompt":
+                continue
+
+            prompt = str(msg.get("text") or "").strip()
+            if not prompt:
+                await send({"type": "error", "error": "missing prompt text"})
+                continue
+
+            cancel_flag = False
+            await send({"type": "status", "status": "generating"})
+
+            # Build the story prompt that instructs Gemini to interleave text + images
+            story_prompt = (
+                "You are a creative storyteller and visual artist. "
+                "Create an immersive, illustrated story based on the user's prompt. "
+                "Structure it as 4-6 scenes. For each scene:\n"
+                "1. Write 2-3 sentences of vivid narration\n"
+                "2. Generate an illustration for that scene in a beautiful storybook art style\n"
+                "Alternate between narration and images throughout. "
+                "Make the story engaging, emotional, and visually rich.\n\n"
+                f"Story prompt: {prompt}"
+            )
+
+            try:
+                gen_client = _make_genai_client(
+                    prefer_vertex=True, project=project, location=location
+                )
+
+                def _run_story() -> list[dict]:
+                    """Run generate_content in thread, return list of parts as dicts."""
+                    resp = gen_client.models.generate_content(
+                        model="gemini-2.0-flash-exp",
+                        contents=story_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["TEXT", "IMAGE"],
+                            temperature=0.9,
+                            max_output_tokens=8192,
+                        ),
+                    )
+                    parts = []
+                    for part in resp.candidates[0].content.parts:
+                        if getattr(part, "text", None):
+                            parts.append({"kind": "text", "text": part.text})
+                        elif getattr(part, "inline_data", None):
+                            parts.append({
+                                "kind": "image",
+                                "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                "mime_type": part.inline_data.mime_type or "image/png",
+                            })
+                    return parts
+
+                parts = await asyncio.to_thread(_run_story)
+
+                # Stream parts to client with TTS for text chunks
+                pending_text = ""
+                for idx, part in enumerate(parts):
+                    if cancel_flag:
+                        break
+
+                    if part["kind"] == "text":
+                        text = part["text"]
+                        pending_text += text
+                        await send({"type": "text", "text": text, "index": idx})
+
+                    elif part["kind"] == "image":
+                        # Synthesize TTS for accumulated text before this image
+                        if pending_text.strip():
+                            audio_bytes = await tts_synthesize(pending_text)
+                            if audio_bytes:
+                                await send({
+                                    "type": "audio",
+                                    "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                                    "mime_type": "audio/mpeg",
+                                    "index": idx,
+                                })
+                            pending_text = ""
+
+                        await send({
+                            "type": "image",
+                            "data_b64": part["data"],
+                            "mime_type": part["mime_type"],
+                            "index": idx,
+                        })
+
+                # TTS for any trailing text after last image
+                if pending_text.strip() and not cancel_flag:
+                    audio_bytes = await tts_synthesize(pending_text)
+                    if audio_bytes:
+                        await send({
+                            "type": "audio",
+                            "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                            "mime_type": "audio/mpeg",
+                            "index": 9999,
+                        })
+
+                await send({"type": "status", "status": "done"})
+                await send({"type": "done"})
+
+            except Exception as e:
+                await send({"type": "error", "error": str(e)})
+
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        try:
+            await send({"type": "error", "error": str(exc)})
+        except Exception:
+            pass
+
+
 class AgentMessageRequest(BaseModel):
     user_id: str | None = None
     message: str = Field(min_length=1)

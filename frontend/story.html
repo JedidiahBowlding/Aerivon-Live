@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aerivon Storybook - Multimodal AI Storytelling</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Georgia', serif;
+      background: #0f0c1a;
+      color: #e8dfc8;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      text-align: center;
+      padding: 2rem 1rem 1rem;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    header h1 {
+      font-size: 2rem;
+      letter-spacing: 0.1em;
+      background: linear-gradient(135deg, #c9a84c, #e8dfc8, #c9a84c);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    header p {
+      color: rgba(232,223,200,0.5);
+      font-size: 0.9rem;
+      margin-top: 0.4rem;
+      font-style: italic;
+    }
+
+    .controls {
+      display: flex;
+      gap: 0.75rem;
+      padding: 1.25rem 1.5rem;
+      background: rgba(255,255,255,0.03);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .controls textarea {
+      flex: 1;
+      min-width: 240px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(201,168,76,0.3);
+      border-radius: 8px;
+      color: #e8dfc8;
+      font-family: Georgia, serif;
+      font-size: 0.95rem;
+      padding: 0.65rem 0.9rem;
+      resize: vertical;
+      min-height: 70px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .controls textarea:focus {
+      border-color: rgba(201,168,76,0.7);
+    }
+
+    .controls textarea::placeholder {
+      color: rgba(232,223,200,0.3);
+      font-style: italic;
+    }
+
+    .btn {
+      padding: 0.65rem 1.4rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #c9a84c, #a8843a);
+      color: #0f0c1a;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 16px rgba(201,168,76,0.4);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: rgba(255,255,255,0.08);
+      color: #e8dfc8;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: rgba(255,255,255,0.13);
+    }
+
+    .btn-secondary:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .status-bar {
+      padding: 0.4rem 1.5rem;
+      font-size: 0.8rem;
+      color: rgba(232,223,200,0.45);
+      font-style: italic;
+      min-height: 1.8rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .status-bar.active { color: #c9a84c; }
+    .status-bar.error  { color: #e05c5c; }
+
+    .spinner {
+      width: 12px; height: 12px;
+      border: 2px solid rgba(201,168,76,0.3);
+      border-top-color: #c9a84c;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: none;
+    }
+
+    .status-bar.active .spinner { display: block; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Story canvas */
+    #story {
+      flex: 1;
+      padding: 2rem 1.5rem 4rem;
+      max-width: 820px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .scene {
+      margin-bottom: 2.5rem;
+      animation: fadeIn 0.6s ease forwards;
+      opacity: 0;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .scene-text {
+      font-size: 1.1rem;
+      line-height: 1.85;
+      color: #e8dfc8;
+      margin-bottom: 1.25rem;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    }
+
+    .scene-image {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid rgba(201,168,76,0.2);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      display: block;
+      margin-bottom: 0.5rem;
+    }
+
+    .image-placeholder {
+      width: 100%;
+      height: 240px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 12px;
+      border: 1px dashed rgba(201,168,76,0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(232,223,200,0.25);
+      font-style: italic;
+      font-size: 0.9rem;
+      margin-bottom: 0.5rem;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.5; }
+      50% { opacity: 1; }
+    }
+
+    .divider {
+      border: none;
+      border-top: 1px solid rgba(201,168,76,0.12);
+      margin: 2rem 0;
+    }
+
+    /* Example prompts */
+    .examples {
+      padding: 0 1.5rem 1rem;
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      max-width: 820px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .example-chip {
+      background: rgba(201,168,76,0.08);
+      border: 1px solid rgba(201,168,76,0.2);
+      border-radius: 20px;
+      padding: 0.3rem 0.9rem;
+      font-size: 0.8rem;
+      color: rgba(232,223,200,0.6);
+      cursor: pointer;
+      transition: all 0.2s;
+      font-style: italic;
+    }
+
+    .example-chip:hover {
+      background: rgba(201,168,76,0.16);
+      color: #e8dfc8;
+    }
+
+    /* Audio player (hidden, just for autoplay) */
+    #audioPlayer { display: none; }
+
+    /* Empty state */
+    #emptyState {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: rgba(232,223,200,0.2);
+    }
+
+    #emptyState .icon { font-size: 3rem; margin-bottom: 1rem; }
+    #emptyState p { font-style: italic; font-size: 1rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>✨ Aerivon Storybook</h1>
+  <p>AI-narrated illustrated stories, generated in real time with Gemini multimodal</p>
+</header>
+
+<div class="controls">
+  <textarea id="promptInput" placeholder="Enter a story prompt… e.g. 'A young astronaut discovers a hidden ocean on Europa'" rows="2"></textarea>
+  <div style="display:flex;flex-direction:column;gap:0.5rem;">
+    <button class="btn btn-primary" id="tellBtn">✨ Tell Story</button>
+    <button class="btn btn-secondary" id="stopBtn" disabled>⏹ Stop</button>
+  </div>
+</div>
+
+<div class="examples" id="examples">
+  <span class="example-chip">A dragon who fears fire</span>
+  <span class="example-chip">Lost city beneath the Sahara</span>
+  <span class="example-chip">Robot who learns to dream</span>
+  <span class="example-chip">A lighthouse at the edge of the universe</span>
+  <span class="example-chip">Time traveler stuck in ancient Rome</span>
+  <span class="example-chip">Mermaid who wants to fly</span>
+</div>
+
+<div class="status-bar" id="statusBar">
+  <div class="spinner"></div>
+  <span id="statusText">Ready</span>
+</div>
+
+<div id="story">
+  <div id="emptyState">
+    <div class="icon">📖</div>
+    <p>Your illustrated story will appear here</p>
+  </div>
+</div>
+
+<audio id="audioPlayer" autoplay></audio>
+
+<script>
+  const tellBtn = document.getElementById('tellBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const promptInput = document.getElementById('promptInput');
+  const statusBar = document.getElementById('statusBar');
+  const statusText = document.getElementById('statusText');
+  const storyEl = document.getElementById('story');
+  const emptyState = document.getElementById('emptyState');
+  const audioPlayer = document.getElementById('audioPlayer');
+
+  // Example chips
+  document.querySelectorAll('.example-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      promptInput.value = chip.textContent;
+      promptInput.focus();
+    });
+  });
+
+  let ws = null;
+  let audioQueue = [];
+  let audioPlaying = false;
+
+  function getBackendWsBase() {
+    try {
+      const injected = window.AERIVON_BACKEND_BASE ? String(window.AERIVON_BACKEND_BASE).trim() : '';
+      if (injected) return injected.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:').replace(/\/$/, '');
+    } catch {}
+    try {
+      const qp = new URL(location.href).searchParams.get('backend');
+      if (qp) return qp.trim().replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:').replace(/\/$/, '');
+    } catch {}
+    if (/\.run\.app$/i.test(location.hostname)) {
+      const backendHost = location.hostname.replace(/frontend/i, 'agent');
+      return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${backendHost}`;
+    }
+    return `ws://${location.hostname}:8081`;
+  }
+
+  function setStatus(text, mode = '') {
+    statusText.textContent = text;
+    statusBar.className = 'status-bar' + (mode ? ` ${mode}` : '');
+  }
+
+  // Audio queue — play MP3 chunks sequentially
+  async function playAudioChunk(b64) {
+    audioQueue.push(b64);
+    if (!audioPlaying) drainAudioQueue();
+  }
+
+  function drainAudioQueue() {
+    if (audioQueue.length === 0) { audioPlaying = false; return; }
+    audioPlaying = true;
+    const b64 = audioQueue.shift();
+    const blob = new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+    audioPlayer.src = url;
+    audioPlayer.onended = () => { URL.revokeObjectURL(url); drainAudioQueue(); };
+    audioPlayer.onerror = () => { URL.revokeObjectURL(url); drainAudioQueue(); };
+    audioPlayer.play().catch(() => {});
+  }
+
+  // Append a text scene node
+  let currentTextEl = null;
+
+  function appendText(text) {
+    if (emptyState.parentNode) emptyState.remove();
+    if (!currentTextEl) {
+      const scene = document.createElement('div');
+      scene.className = 'scene';
+      const p = document.createElement('p');
+      p.className = 'scene-text';
+      scene.appendChild(p);
+      storyEl.appendChild(scene);
+      currentTextEl = p;
+    }
+    currentTextEl.textContent += text;
+  }
+
+  function appendImage(b64, mimeType) {
+    currentTextEl = null; // next text starts a new scene
+    const scene = document.createElement('div');
+    scene.className = 'scene';
+    const img = document.createElement('img');
+    img.className = 'scene-image';
+    img.src = `data:${mimeType};base64,${b64}`;
+    img.alt = 'Story illustration';
+    scene.appendChild(img);
+
+    // Add a divider after image
+    const hr = document.createElement('hr');
+    hr.className = 'divider';
+    scene.appendChild(hr);
+
+    storyEl.appendChild(scene);
+    img.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function clearStory() {
+    storyEl.innerHTML = '';
+    storyEl.appendChild(emptyState.cloneNode(true));
+    currentTextEl = null;
+    audioQueue = [];
+    audioPlaying = false;
+    audioPlayer.pause();
+    audioPlayer.src = '';
+  }
+
+  function startStory() {
+    const prompt = promptInput.value.trim();
+    if (!prompt) { promptInput.focus(); return; }
+
+    clearStory();
+    tellBtn.disabled = true;
+    stopBtn.disabled = false;
+    setStatus('Connecting…', 'active');
+
+    const wsBase = getBackendWsBase();
+    ws = new WebSocket(`${wsBase}/ws/story`);
+
+    ws.onopen = () => {
+      setStatus('Generating your story…', 'active');
+      ws.send(JSON.stringify({ type: 'prompt', text: prompt }));
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (!msg || !msg.type) return;
+
+        if (msg.type === 'text') {
+          appendText(msg.text);
+        } else if (msg.type === 'image') {
+          appendImage(msg.data_b64, msg.mime_type || 'image/png');
+        } else if (msg.type === 'audio') {
+          playAudioChunk(msg.data_b64);
+        } else if (msg.type === 'status') {
+          if (msg.status === 'done') {
+            setStatus('Story complete ✨');
+            tellBtn.disabled = false;
+            stopBtn.disabled = true;
+          } else if (msg.status === 'generating') {
+            setStatus('Weaving your story…', 'active');
+          }
+        } else if (msg.type === 'done') {
+          setStatus('Story complete ✨');
+          tellBtn.disabled = false;
+          stopBtn.disabled = true;
+        } else if (msg.type === 'error') {
+          setStatus(`Error: ${msg.error}`, 'error');
+          tellBtn.disabled = false;
+          stopBtn.disabled = true;
+        }
+      } catch {}
+    };
+
+    ws.onerror = () => {
+      setStatus('Connection error', 'error');
+      tellBtn.disabled = false;
+      stopBtn.disabled = true;
+    };
+
+    ws.onclose = () => {
+      if (!stopBtn.disabled) {
+        setStatus('Disconnected', 'error');
+        tellBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    };
+  }
+
+  function stopStory() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'interrupt' }));
+      ws.close(1000, 'user_stop');
+    }
+    audioQueue = [];
+    audioPlaying = false;
+    audioPlayer.pause();
+    setStatus('Stopped');
+    tellBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  tellBtn.addEventListener('click', startStory);
+  stopBtn.addEventListener('click', stopStory);
+
+  promptInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) startStory();
+  });
+
+  setStatus('Ready');
+</script>
+</body>
+</html>
