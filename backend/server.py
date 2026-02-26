@@ -854,7 +854,7 @@ async def ws_story(websocket: WebSocket) -> None:
             story_prompt = (
                 "You are a creative storyteller and visual artist. "
                 "Create an immersive, illustrated story based on the user's prompt. "
-                "Structure it as 4-6 scenes. For each scene:\n"
+                "Structure it as 2 scenes only. For each scene:\n"
                 "1. Write 2-3 sentences of vivid narration\n"
                 "2. Generate an illustration for that scene in a beautiful storybook art style\n"
                 "Alternate between narration and images throughout. "
@@ -878,7 +878,7 @@ async def ws_story(websocket: WebSocket) -> None:
                             config=types.GenerateContentConfig(
                                 response_modalities=["TEXT", "IMAGE"],
                                 temperature=0.9,
-                                max_output_tokens=8192,
+                                max_output_tokens=4096,
                             ),
                         )
                         print(f"[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
