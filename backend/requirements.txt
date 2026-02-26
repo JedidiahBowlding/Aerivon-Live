@@ -7,3 +7,4 @@ google-cloud-storage
 google-cloud-firestore
 python-multipart
 google-cloud-texttospeech
+google-cloud-aiplatform

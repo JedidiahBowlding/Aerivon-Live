@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import datetime
 import json
 import os
 import re
+import sys
 import time
 import hashlib
 from typing import Any
@@ -737,7 +739,36 @@ async def ws_story(websocket: WebSocket) -> None:
             print(f"[STORY TTS] Error: {e}", file=sys.stderr)
             return None
 
-    await send({"type": "status", "status": "connected", "model": "gemini-2.0-flash-exp"})
+    # Image generation helper using Imagen 3 via Vertex AI
+    async def generate_image(prompt: str) -> bytes | None:
+        if not prompt or len(prompt) < 3:
+            return None
+        try:
+            import vertexai  # type: ignore
+            from vertexai.preview.vision_models import ImageGenerationModel  # type: ignore
+
+            def _generate() -> bytes | None:
+                # Initialize Vertex AI
+                vertexai.init(project=project, location="global")
+                
+                model = ImageGenerationModel.from_pretrained("imagegeneration@006")
+                images = model.generate_images(
+                    prompt=f"{prompt}, storybook illustration art style, vibrant colors, whimsical",
+                    number_of_images=1,
+                    aspect_ratio="1:1",
+                    safety_filter_level="block_some",
+                    person_generation="allow_adult",
+                )
+                if images and len(images.images) > 0:
+                    return images.images[0]._image_bytes
+                return None
+
+            return await asyncio.to_thread(_generate)
+        except Exception as e:
+            print(f"[STORY IMAGE] Error generating image: {e}", file=sys.stderr)
+            return None
+
+    await send({"type": "status", "status": "connected", "model": "gemini-2.5-flash-image-preview"})
 
     try:
         while True:
@@ -778,30 +809,41 @@ async def ws_story(websocket: WebSocket) -> None:
 
             try:
                 gen_client = _make_genai_client(
-                    prefer_vertex=True, project=project, location=location
+                    prefer_vertex=True, project=project, location="global"
                 )
 
                 def _run_story() -> list[dict]:
                     """Run generate_content in thread, return list of parts as dicts."""
-                    resp = gen_client.models.generate_content(
-                        model="gemini-2.0-flash-exp",
-                        contents=story_prompt,
-                        config=types.GenerateContentConfig(
-                            response_modalities=["TEXT", "IMAGE"],
-                            temperature=0.9,
-                            max_output_tokens=8192,
-                        ),
-                    )
+                    print(f"[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image-preview", file=sys.stderr)
+                    try:
+                        resp = gen_client.models.generate_content(
+                            model="gemini-2.5-flash-image-preview",
+                            contents=story_prompt,
+                            config=types.GenerateContentConfig(
+                                response_modalities=["TEXT", "IMAGE"],
+                                temperature=0.9,
+                                max_output_tokens=8192,
+                            ),
+                        )
+                        print(f"[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
+                    except Exception as gemini_error:
+                        print(f"[STORY ERROR] Gemini API call failed: {type(gemini_error).__name__}: {gemini_error}", file=sys.stderr)
+                        raise
+                    
+                    # Extract parts from multimodal response
                     parts = []
-                    for part in resp.candidates[0].content.parts:
-                        if getattr(part, "text", None):
-                            parts.append({"kind": "text", "text": part.text})
-                        elif getattr(part, "inline_data", None):
-                            parts.append({
-                                "kind": "image",
-                                "data": base64.b64encode(part.inline_data.data).decode("ascii"),
-                                "mime_type": part.inline_data.mime_type or "image/png",
-                            })
+                    for candidate in resp.candidates:
+                        for part in candidate.content.parts:
+                            if part.text:
+                                parts.append({"kind": "text", "text": part.text})
+                            elif part.inline_data:
+                                parts.append({
+                                    "kind": "image",
+                                    "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                    "mime_type": part.inline_data.mime_type,
+                                })
+                    
+                    print(f"[STORY DEBUG] Extracted {len(parts)} parts from response", file=sys.stderr)
                     return parts
 
                 parts = await asyncio.to_thread(_run_story)
@@ -898,6 +940,96 @@ async def health() -> dict[str, Any]:
         "project": project,
         "location": location,
     }
+
+
+@app.post("/story/save")
+async def save_story(request: Request) -> dict[str, Any]:
+    """Save a generated story to GCS."""
+    try:
+        data = await request.json()
+        prompt = data.get("prompt", "")
+        scenes = data.get("scenes", [])
+        created = data.get("created", "")
+        
+        if not prompt or not scenes:
+            raise HTTPException(status_code=400, detail="Missing prompt or scenes")
+        
+        # Generate unique ID from timestamp + prompt hash
+        story_id = f"{int(time.time())}_{hashlib.sha256(prompt.encode()).hexdigest()[:8]}"
+        
+        # Get GCS bucket (use same bucket as agent memory)
+        bucket_name = os.getenv("AERIVON_MEMORY_BUCKET", "aerivon-live-agent-memory-1771792693")
+        
+        # Prepare story data
+        story_data = {
+            "id": story_id,
+            "prompt": prompt,
+            "scenes": scenes,
+            "created": created,
+            "saved_at": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        # Save to GCS
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(f"stories/{story_id}.json")
+        
+        blob.upload_from_string(
+            json.dumps(story_data, indent=2),
+            content_type="application/json"
+        )
+        
+        print(f"[STORY SAVE] Saved story {story_id} to gs://{bucket_name}/stories/{story_id}.json", file=sys.stderr)
+        
+        return {
+            "success": True,
+            "story_id": story_id,
+            "url": f"gs://{bucket_name}/stories/{story_id}.json"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[STORY SAVE ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Failed to save story: {str(e)}")
+
+
+@app.get("/story/list")
+async def list_stories() -> dict[str, Any]:
+    """List all saved stories from GCS."""
+    try:
+        bucket_name = os.getenv("AERIVON_MEMORY_BUCKET", "aerivon-live-agent-memory-1771792693")
+        
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        
+        # List all blobs in stories/ prefix
+        blobs = bucket.list_blobs(prefix="stories/")
+        
+        stories = []
+        for blob in blobs:
+            if blob.name.endswith(".json"):
+                # Get story metadata
+                story_id = blob.name.replace("stories/", "").replace(".json", "")
+                stories.append({
+                    "story_id": story_id,
+                    "url": f"gs://{bucket_name}/{blob.name}",
+                    "updated": blob.updated.isoformat() if blob.updated else None,
+                    "size": blob.size
+                })
+        
+        # Sort by story_id (which starts with timestamp) descending
+        stories.sort(key=lambda s: s["story_id"], reverse=True)
+        
+        return {
+            "success": True,
+            "count": len(stories),
+            "stories": stories
+        }
+        
+    except Exception as e:
+        print(f"[STORY LIST ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Failed to list stories: {str(e)}")
 
 
 @app.get("/agent/startup-check")

@@ -261,6 +261,7 @@
     <button class="btn btn-primary" id="tellBtn">✨ Tell Story</button>
     <button class="btn btn-secondary" id="stopBtn" disabled>⏹ Stop</button>
   </div>
+  <button class="btn btn-secondary" id="saveBtn" disabled style="margin-left:auto;">💾 Save Story</button>
 </div>
 
 <div class="examples" id="examples">
@@ -307,6 +308,7 @@
   let ws = null;
   let audioQueue = [];
   let audioPlaying = false;
+  let currentStoryData = null; // Track current story for saving
 
   function getBackendWsBase() {
     try {
@@ -391,6 +393,8 @@
     audioPlaying = false;
     audioPlayer.pause();
     audioPlayer.src = '';
+    currentStoryData = null;
+    saveBtn.disabled = true;
   }
 
   function startStory() {
@@ -398,8 +402,10 @@
     if (!prompt) { promptInput.focus(); return; }
 
     clearStory();
+    currentStoryData = { prompt, scenes: [], created: new Date().toISOString() };
     tellBtn.disabled = true;
     stopBtn.disabled = false;
+    saveBtn.disabled = true;
     setStatus('Connecting…', 'active');
 
     const wsBase = getBackendWsBase();
@@ -417,8 +423,18 @@
 
         if (msg.type === 'text') {
           appendText(msg.text);
+          if (currentStoryData) {
+            if (!currentStoryData.scenes.length || currentStoryData.scenes[currentStoryData.scenes.length - 1].type === 'image') {
+              currentStoryData.scenes.push({ type: 'text', content: msg.text });
+            } else {
+              currentStoryData.scenes[currentStoryData.scenes.length - 1].content += msg.text;
+            }
+          }
         } else if (msg.type === 'image') {
           appendImage(msg.data_b64, msg.mime_type || 'image/png');
+          if (currentStoryData) {
+            currentStoryData.scenes.push({ type: 'image', data: msg.data_b64, mimeType: msg.mime_type || 'image/png' });
+          }
         } else if (msg.type === 'audio') {
           playAudioChunk(msg.data_b64);
         } else if (msg.type === 'status') {
@@ -426,6 +442,7 @@
             setStatus('Story complete ✨');
             tellBtn.disabled = false;
             stopBtn.disabled = true;
+            saveBtn.disabled = false;
           } else if (msg.status === 'generating') {
             setStatus('Weaving your story…', 'active');
           }
@@ -433,6 +450,7 @@
           setStatus('Story complete ✨');
           tellBtn.disabled = false;
           stopBtn.disabled = true;
+          saveBtn.disabled = false;
         } else if (msg.type === 'error') {
           setStatus(`Error: ${msg.error}`, 'error');
           tellBtn.disabled = false;
@@ -471,6 +489,36 @@
 
   tellBtn.addEventListener('click', startStory);
   stopBtn.addEventListener('click', stopStory);
+
+  saveBtn.addEventListener('click', async () => {
+    if (!currentStoryData) return;
+    
+    saveBtn.disabled = true;
+    const originalText = saveBtn.textContent;
+    saveBtn.textContent = '💾 Saving...';
+    
+    try {
+      const backendBase = getBackendWsBase().replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:');
+      const response = await fetch(`${backendBase}/story/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(currentStoryData)
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        saveBtn.textContent = '✅ Saved!';
+        setStatus(`Story saved: ${result.story_id}`);
+        setTimeout(() => { saveBtn.textContent = originalText; saveBtn.disabled = false; }, 2000);
+      } else {
+        throw new Error(await response.text());
+      }
+    } catch (error) {
+      saveBtn.textContent = '❌ Failed';
+      setStatus(`Save error: ${error.message}`, 'error');
+      setTimeout(() => { saveBtn.textContent = originalText; saveBtn.disabled = false; }, 2000);
+    }
+  });
 
   promptInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) startStory();
