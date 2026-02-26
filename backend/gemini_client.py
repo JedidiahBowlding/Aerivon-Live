@@ -61,7 +61,7 @@ def check_live_model_availability(project: str | None, location: str) -> dict[st
                 "probe": "live_connect",
             }
         except RuntimeError:
-            # If we're already in an event loop somewhere, fall back to listing.
+            # If already in an event loop somewhere, fall back to listing.
             pass
         except Exception as e:
             return {

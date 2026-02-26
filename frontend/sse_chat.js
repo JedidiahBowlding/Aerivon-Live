@@ -404,7 +404,7 @@ async function recordOnceToTranscript() {
 
     sttWs.onclose = () => {
       if (!finished && !recording) {
-        // If closed early, resolve whatever we have.
+        // If closed early, resolve whatever is available.
         resolve(transcript.trim());
       }
     };

@@ -328,7 +328,7 @@ def generate_outreach_message(
     message = (
         f"Hi {business_name} team,\n\n"
         f"I reviewed {website} and noticed opportunities to improve lead conversion. "
-        f"We help businesses like yours with {service}.\n\n"
+        f"I help businesses like yours with {service}.\n\n"
         "Would you be open to a short 15-minute call this week?\n\n"
         "Best,\n"
         "Aerivon Live"

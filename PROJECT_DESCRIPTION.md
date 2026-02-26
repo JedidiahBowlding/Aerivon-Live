@@ -286,6 +286,6 @@ print(f"[STORY ERROR] {type(e).__name__}: {e}", file=sys.stderr)
 
 ## Conclusion
 
-Aerivon Live Agent demonstrates the power of Google's Gemini Live API for building rich, multimodal AI applications. The project showcases best practices for real-time streaming, multimodal content generation, cloud storage integration, and user experience design. Through iterative development, we learned the importance of using native model capabilities, proper environment configuration, thoughtful state management, and comprehensive error handling.
+Aerivon Live Agent demonstrates the power of Google's Gemini Live API for building rich, multimodal AI applications. The project showcases best practices for real-time streaming, multimodal content generation, cloud storage integration, and user experience design. Through iterative development, I learned the importance of using native model capabilities, proper environment configuration, thoughtful state management, and comprehensive error handling.
 
 The storybook feature, in particular, highlights how modern multimodal AI can create engaging, visually rich content in real-time, with the ability to preserve and share those creations through cloud-based storage solutions.

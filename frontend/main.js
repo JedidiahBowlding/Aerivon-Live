@@ -652,7 +652,7 @@ async function applyAudioConfig(sampleRate) {
   const sr = Number(sampleRate);
   if (!Number.isFinite(sr) || sr <= 0) return;
   playbackSampleRate = sr;
-  // If we already created an AudioContext at a different rate, recreate it.
+  // If an AudioContext was already created at a different rate, recreate it.
   if (playbackCtx && playbackCtx.sampleRate !== playbackSampleRate) {
     stopPlayback();
     try { await playbackCtx.close(); } catch {}
@@ -962,7 +962,7 @@ async function liveSttOnce() {
       if (!navSttWs || navSttWs.readyState !== WebSocket.OPEN) return;
 
       if (sentAudioEnd) {
-        // Don't accidentally start a second turn while we're waiting for turn_complete.
+        // Don't accidentally start a second turn while waiting for turn_complete.
         return;
       }
 
@@ -1266,7 +1266,7 @@ async function startMic() {
     // Always evaluate barge-in on every frame while model audio may be active.
     handleMicFrameForBargeIn(down, ws, 'barge-in');
 
-    // VAD: only stream frames when we believe the user is speaking. When we detect
+    // VAD: only stream frames when the system detects the user is speaking. When it detects
     // enough silence after speech, send audio_end to close the utterance.
     const level = rms(down);
     const t = performance.now();
@@ -1428,7 +1428,7 @@ if (HAS_UI_NAVIGATOR_UI) {
       log('NAV: missing task');
       return;
     }
-    // Demo-friendly: if a URL is present, open it first so we don't plan against about:blank.
+    // Demo-friendly: if a URL is present, open it first so the planner doesn't work against about:blank.
     let url = (navUrlEl.value || '').trim();
     if (url) {
       if (!/^https?:\/\//i.test(url)) url = `https://${url}`;

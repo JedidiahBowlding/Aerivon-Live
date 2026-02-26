@@ -1178,8 +1178,8 @@ async def ws_live(websocket: WebSocket) -> None:
     vertex_live_enabled = bool(use_vertex and project)
     # If Vertex Live isn't configured, this WS will fall back to standard generation.
 
-    # Do NOT pre-probe models.list() here; it can hang. We'll attempt a Live connect and if that
-    # fails we'll fall back to standard generation.
+    # Do NOT pre-probe models.list() here; it can hang. I'll attempt a Live connect and if that
+    # fails it will fall back to standard generation.
     live_available: bool | None = None
 
     mode = (websocket.query_params.get("mode") or "agent").strip().lower()
@@ -1333,7 +1333,7 @@ async def ws_live(websocket: WebSocket) -> None:
                     raise WebSocketDisconnect(code=1006)
                 raise
 
-        # Pick a standard model. If we don't have a Vertex project, skip model listing.
+        # Pick a standard model. If there's no Vertex project, skip model listing.
         preferred = os.getenv(
             "AERIVON_WS_FALLBACK_MODEL",
             os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"),
@@ -2152,7 +2152,7 @@ async def post_agent_message_stream(payload: AgentMessageRequest, request: Reque
         except Exception as exc:
             yield sse("error", {"type": "error", "error": str(exc)})
         finally:
-            # Only persist full exchange if we completed normally.
+            # Only persist full exchange if it completed normally.
             if not interrupted:
                 await _append_exchange_to_memory(
                     user_id=user_id,
@@ -2160,7 +2160,7 @@ async def post_agent_message_stream(payload: AgentMessageRequest, request: Reque
                     model_text="".join(text_parts),
                 )
 
-            # Clean up cancel registry if we're still the active stream.
+            # Clean up cancel registry if this is still the active stream.
             current = ACTIVE_SSE_CANCEL.get(user_id)
             if current is cancel_event:
                 ACTIVE_SSE_CANCEL.pop(user_id, None)

@@ -470,7 +470,7 @@ async function ensureWs() {
   if (els.wsUrl) els.wsUrl.textContent = url;
 
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    // If we already have a connect-in-progress for the same URL, await it.
+    // If there's already a connect-in-progress for the same URL, await it.
     if (wsOpenPromise && wsOpenPromiseUrl === url) {
       await wsOpenPromise;
     }
