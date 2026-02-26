@@ -1160,48 +1160,72 @@ async def security_check() -> dict[str, Any]:
 
 @app.post("/agent/speak")
 async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
-    """Synthesize speech as MP3 using Google Cloud Text-to-Speech.
+    """Synthesize speech using Gemini Live API.
 
-    This is used by the Translator demo to provide voice output even when
-    Gemini Live audio output isn't available.
+    Returns PCM16 audio at 24kHz for natural voice synthesis.
     """
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-    try:
-        from google.cloud import texttospeech  # type: ignore
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Text-to-Speech unavailable: {exc}")
+    if not use_vertex or not project:
+        raise HTTPException(status_code=500, detail="Vertex AI not configured")
 
-    lang = (payload.lang or os.getenv("AERIVON_TTS_LANG") or "en-US").strip() or "en-US"
-    voice_name = (payload.voice or os.getenv("AERIVON_TTS_VOICE") or "").strip()
     text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
 
-    def _synth() -> bytes:
-        client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code=lang,
-            name=voice_name if voice_name else None,
-        )
-        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-        resp = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config,
-        )
-        return bytes(resp.audio_content or b"")
+    def _narrate_live() -> bytes:
+        """Use Gemini Live API to generate speech."""
+        try:
+            client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            
+            # Create Live session for speech synthesis
+            session = client.live.connect(
+                model="gemini-2.0-flash-exp",
+                config=types.LiveConnectConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name="Puck"  # Natural conversational voice
+                            )
+                        )
+                    ),
+                ),
+            )
+            
+            # Send text for narration
+            session.send(text, end_of_turn=True)
+            
+            # Collect audio chunks
+            audio_chunks = []
+            for response in session.receive():
+                if response.data:
+                    audio_chunks.append(response.data)
+                if response.server_content and response.server_content.turn_complete:
+                    break
+            
+            if audio_chunks:
+                return b"".join(audio_chunks)
+            return b""
+            
+        except Exception as e:
+            print(f"[SPEAK] Gemini Live error: {e}", file=sys.stderr)
+            raise
 
     try:
-        audio = await asyncio.to_thread(_synth)
+        audio = await asyncio.to_thread(_narrate_live)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
     if not audio:
-        raise HTTPException(status_code=500, detail="No audio returned")
+        raise HTTPException(status_code=500, detail="No audio generated")
 
     async def body():
         yield audio
 
-    return StreamingResponse(body(), media_type="audio/mpeg")
+    return StreamingResponse(body(), media_type="audio/pcm;rate=24000")
 
 
 @app.get("/agent/architecture")

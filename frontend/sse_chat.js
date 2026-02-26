@@ -237,14 +237,33 @@ async function playTtsForText(text) {
     return;
   }
 
-  const buf = await res.arrayBuffer();
-  const blob = new Blob([buf], { type: 'audio/mpeg' });
-  const url = URL.createObjectURL(blob);
   try {
-    // Stop any current playback.
-    try { els.voiceOut.pause(); } catch {}
-    els.voiceOut.src = url;
-    await els.voiceOut.play();
+    // Get PCM16 audio buffer from Gemini Live API
+    const pcmData = new Uint8Array(await res.arrayBuffer());
+    
+    // Create Web Audio context if needed
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    
+    // Convert PCM16 to Float32 for Web Audio API
+    const numSamples = pcmData.length / 2;
+    const audioBuffer = audioContext.createBuffer(1, numSamples, 24000);
+    const channelData = audioBuffer.getChannelData(0);
+    
+    for (let i = 0; i < numSamples; i++) {
+      // Read 16-bit signed integer (little-endian)
+      const int16 = (pcmData[i * 2 + 1] << 8) | pcmData[i * 2];
+      // Convert to signed if necessary
+      const signed = int16 > 32767 ? int16 - 65536 : int16;
+      // Normalize to [-1, 1]
+      channelData[i] = signed / 32768.0;
+    }
+    
+    // Play the audio
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.destination);
+    source.start(0);
+    
     appendPre(els.log, `[${nowMs()}] TTS: playing\n`);
   } catch (e) {
     appendPre(els.log, `[${nowMs()}] TTS play failed: ${e?.message || e}\n`);
