@@ -109,6 +109,7 @@ let serverSessionId = null;
 let suppressOutputUntilConnected = false;
 let pendingTurnComplete = false;
 let lastServerOutputAt = 0;
+let lastServerAudioAt = 0;
 let vadNoiseFloor = 0.0015;
 let aggressiveVadMs = 0;
 let debugPanelEl = null;
@@ -275,7 +276,7 @@ function handleMicFrameForBargeIn(frame, targetWs, source = 'barge-in') {
   vadLastTs = now;
 
   const level = rms(frame);
-  const speakingWindowActive = (now - lastServerOutputAt) < 8000;
+  const speakingWindowActive = (now - lastServerAudioAt) < 1200;
   const speakingGateActive = agentState === AgentState.SPEAKING || isAudioPlayingOrQueued() || speakingWindowActive;
 
   // Learn ambient noise only when the agent is not speaking and no recent output is active.
@@ -306,18 +307,10 @@ function handleMicFrameForBargeIn(frame, targetWs, source = 'barge-in') {
   }
 
   if (!speakingGateActive) {
-    if (level > AGGRESSIVE_INTERRUPT_RMS) aggressiveVadMs += dt;
-    else aggressiveVadMs = Math.max(0, aggressiveVadMs - dt * 2);
-
-    if (aggressiveVadMs >= AGGRESSIVE_INTERRUPT_MS) {
-      aggressiveVadMs = 0;
-      interruptDebug({ source, level: level.toFixed(4) }, 'interrupt_aggressive_fallback');
-      return triggerInterrupt(targetWs, `${source}:aggressive`);
-    }
-
+    aggressiveVadMs = 0;
     vadActiveMs = 0;
     if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
-      interruptDebug({ source, aggressiveVadMs: Math.round(aggressiveVadMs) }, 'interrupt_skip:not_speaking_or_not_queued');
+      interruptDebug({ source }, 'interrupt_skip:not_speaking_or_not_queued');
     }
     return false;
   }
@@ -692,6 +685,7 @@ function buildWsUrl() {
   const url = new URL(`${wsBase}/ws/live`);
   url.searchParams.set('output', 'audio');
   url.searchParams.set('user_id', getOrCreateUserId());
+  url.searchParams.set('memory_scope', 'live_agent');
   return url.toString();
 }
 
@@ -706,6 +700,7 @@ function buildLiveSttWsUrl() {
   url.searchParams.set('output', 'text');
   url.searchParams.set('mode', 'stt');
   url.searchParams.set('user_id', getOrCreateUserId());
+  url.searchParams.set('memory_scope', 'live_stt');
   return url.toString();
 }
 
@@ -715,6 +710,7 @@ function buildLiveTtsWsUrl() {
   url.searchParams.set('output', 'audio');
   url.searchParams.set('mode', 'agent');
   url.searchParams.set('user_id', getOrCreateUserId());
+  url.searchParams.set('memory_scope', 'ui_navigator_tts');
   return url.toString();
 }
 
@@ -1079,6 +1075,10 @@ async function ensureWs() {
       if (msg.type === 'status' && msg.status === 'connected') {
         if (typeof msg.session_id === 'number') serverSessionId = msg.session_id;
         suppressOutputUntilConnected = false;
+        lastServerOutputAt = 0;
+        lastServerAudioAt = 0;
+        vadActiveMs = 0;
+        aggressiveVadMs = 0;
       } else if (serverSessionId != null && typeof msg.session_id === 'number' && msg.session_id !== serverSessionId) {
         return;
       } else if (serverSessionId != null && msg.type !== 'status' && msg.type !== 'error' && typeof msg.session_id !== 'number') {
@@ -1094,6 +1094,10 @@ async function ensureWs() {
         interruptDebug({ status: msg.status, reason: msg.reason || '', detail: msg.detail || '' }, 'ws_status');
         if (msg.status === 'restarting') {
           suppressOutputUntilConnected = true;
+          lastServerOutputAt = 0;
+          lastServerAudioAt = 0;
+          vadActiveMs = 0;
+          aggressiveVadMs = 0;
           stopPlayback();
           setState('thinking');
           return;
@@ -1133,6 +1137,7 @@ async function ensureWs() {
         if (suppressOutputUntilConnected) return;
         updateUIState(AgentState.SPEAKING);
         lastServerOutputAt = performance.now();
+        lastServerAudioAt = lastServerOutputAt;
         const u8 = b64ToU8(msg.data_b64 || '');
         enqueuePcmForPlayback(u8);
         return;
@@ -1141,6 +1146,10 @@ async function ensureWs() {
       if (msg.type === 'interrupted') {
         log(`server reports interrupted${msg.source ? ` source=${msg.source}` : ''}`);
         suppressOutputUntilConnected = true;
+        lastServerOutputAt = 0;
+        lastServerAudioAt = 0;
+        vadActiveMs = 0;
+        aggressiveVadMs = 0;
         updateUIState(AgentState.LISTENING);
         stopPlayback();
         return;

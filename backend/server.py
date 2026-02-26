@@ -137,6 +137,17 @@ def _sanitize_user_id(raw: str | None) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def _memory_user_key(*, user_id: str, scope: str | None) -> str:
+    scope_raw = (scope or "").strip()
+    if not scope_raw:
+        return user_id
+    scope_id = _sanitize_user_id(scope_raw)
+    if scope_id == "default":
+        return user_id
+    composite = f"{user_id}__{scope_id}"
+    return _sanitize_user_id(composite)
+
+
 def _memory_blob_name(user_id: str) -> str:
     prefix = AERIVON_MEMORY_PREFIX
     if not prefix.endswith("/"):
@@ -812,10 +823,12 @@ async def ws_live(websocket: WebSocket) -> None:
 
     # Persistent per-user memory (optional).
     user_id = _sanitize_user_id(websocket.query_params.get("user_id"))
+    memory_scope = (websocket.query_params.get("memory_scope") or "").strip()
+    memory_user_id = _memory_user_key(user_id=user_id, scope=memory_scope)
     user_memory: dict[str, Any] | None = None
     memory_prompt = ""
     if mode != "stt":
-        user_memory = await _load_user_memory(user_id=user_id)
+        user_memory = await _load_user_memory(user_id=memory_user_id)
         memory_prompt = _memory_to_prompt(user_memory)
 
     model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
@@ -960,6 +973,7 @@ async def ws_live(websocket: WebSocket) -> None:
                 "mode": "fallback",
                 "detail": "Gemini Live unavailable; using standard generate_content",
                 "user_id": user_id,
+                "memory_scope": memory_scope or None,
             }
         )
 
@@ -995,6 +1009,7 @@ async def ws_live(websocket: WebSocket) -> None:
             )
             exchanges = exchanges[-AERIVON_MEMORY_MAX_EXCHANGES :]
             mem["user_id"] = user_id
+            mem["memory_user_id"] = memory_user_id
             mem["updated_at"] = int(time.time())
             mem["exchanges"] = exchanges
 
@@ -1005,7 +1020,7 @@ async def ws_live(websocket: WebSocket) -> None:
             mem["summary"] = joined[:1200]
 
             user_memory = mem
-            await _save_user_memory(user_id=user_id, memory=mem)
+            await _save_user_memory(user_id=memory_user_id, memory=mem)
 
         async def generate_and_send(parts: list[types.Part], *, user_text_for_memory: str) -> None:
             # Run sync generate_content in a thread so the event loop stays responsive.
@@ -1042,6 +1057,19 @@ async def ws_live(websocket: WebSocket) -> None:
                 audio_pcm.clear()
                 await ws_send({"type": "interrupted", "source": "client"})
                 await ws_send({"type": "turn_complete"})
+                await ws_send(
+                    {
+                        "type": "status",
+                        "status": "connected",
+                        "model": fallback_model,
+                        "vision": True,
+                        "output": "text",
+                        "mode": "fallback",
+                        "detail": "ready_after_interrupt",
+                        "user_id": user_id,
+                        "memory_scope": memory_scope or None,
+                    }
+                )
                 continue
 
             if msg_type == "text":
@@ -1146,6 +1174,7 @@ async def ws_live(websocket: WebSocket) -> None:
             exchanges.append({"t": int(time.time()), "user": u[:2000], "model": m[:4000]})
             exchanges = exchanges[-AERIVON_MEMORY_MAX_EXCHANGES :]
             mem["user_id"] = user_id
+            mem["memory_user_id"] = memory_user_id
             mem["updated_at"] = int(time.time())
             mem["exchanges"] = exchanges
             joined = " ".join(
@@ -1153,7 +1182,7 @@ async def ws_live(websocket: WebSocket) -> None:
             )
             mem["summary"] = joined[:1200]
             user_memory = mem
-            await _save_user_memory(user_id=user_id, memory=mem)
+            await _save_user_memory(user_id=memory_user_id, memory=mem)
 
         async with client.aio.live.connect(model=model, config=session_config) as stream:
             await ws_send(
@@ -1165,6 +1194,7 @@ async def ws_live(websocket: WebSocket) -> None:
                     "output": output_mode,
                     "mode": mode,
                     "user_id": user_id,
+                    "memory_scope": memory_scope or None,
                     "audio_config": (
                         {
                             "sample_rate": DEFAULT_LIVE_AUDIO_SAMPLE_RATE,

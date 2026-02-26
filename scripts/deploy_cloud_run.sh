@@ -84,7 +84,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --region "$REGION" \
   --source "$SOURCE_DIR" \
   $AUTH_FLAG \
-  "${SA_FLAG[@]}" \
+  ${SA_FLAG[@]+"${SA_FLAG[@]}"} \
   --memory "$MEMORY" \
   --cpu "$CPU" \
   --timeout "$TIMEOUT" \

@@ -188,6 +188,7 @@ const AGGRESSIVE_INTERRUPT_MS = 55;
 let inUtterance = false;
 let lastVoiceMs = 0;
 let lastServerOutputAt = 0;
+let lastServerAudioAt = 0;
 let vadNoiseFloor = 0.0015;
 let aggressiveVadMs = 0;
 let debugPanelEl = null;
@@ -353,7 +354,7 @@ function handleMicFrame(frame) {
   vadLastTs = now;
 
   const level = rms(frame);
-  const speakingWindowActive = (now - lastServerOutputAt) < 8000;
+  const speakingWindowActive = (now - lastServerAudioAt) < 1200;
   const speakingGateActive = agentState === AgentState.SPEAKING || isAudioPlayingOrQueued() || speakingWindowActive;
 
   if (!speakingGateActive) {
@@ -381,19 +382,10 @@ function handleMicFrame(frame) {
   }
 
   if (!speakingGateActive) {
-    if (level > AGGRESSIVE_INTERRUPT_RMS) aggressiveVadMs += dt;
-    else aggressiveVadMs = Math.max(0, aggressiveVadMs - dt * 2);
-
-    if (aggressiveVadMs >= AGGRESSIVE_INTERRUPT_MS) {
-      aggressiveVadMs = 0;
-      interruptDebug({ level: level.toFixed(4) }, 'interrupt_aggressive_fallback');
-      triggerInterrupt('barge-in:aggressive');
-      return;
-    }
-
+    aggressiveVadMs = 0;
     vadActiveMs = 0;
     if (INTERRUPT_DEBUG && now - lastDebugMicTs > 120) {
-      interruptDebug({ aggressiveVadMs: Math.round(aggressiveVadMs) }, 'interrupt_skip:not_speaking_or_not_queued');
+      interruptDebug({}, 'interrupt_skip:not_speaking_or_not_queued');
     }
     return;
   }
@@ -456,6 +448,7 @@ function buildWsUrl() {
   wsUrl.pathname = '/ws/live';
   wsUrl.searchParams.set('output', 'audio');
   wsUrl.searchParams.set('user_id', userId);
+  wsUrl.searchParams.set('memory_scope', 'translator_live');
   wsUrl.searchParams.set('lang', target);
   return wsUrl.toString();
 }
@@ -505,6 +498,10 @@ async function ensureWs() {
 
   ws.onopen = () => {
     updateUIState(AgentState.LISTENING);
+    lastServerOutputAt = 0;
+    lastServerAudioAt = 0;
+    vadActiveMs = 0;
+    aggressiveVadMs = 0;
     interruptDebug({}, 'ws_open');
     log('WS connected');
     try {
@@ -540,6 +537,7 @@ async function ensureWs() {
     if (msg.type === 'audio' && msg.data_b64) {
       updateUIState(AgentState.SPEAKING);
       lastServerOutputAt = performance.now();
+      lastServerAudioAt = lastServerOutputAt;
       const u8 = b64ToU8(String(msg.data_b64));
       enqueuePcmForPlayback(u8);
       return;
@@ -559,6 +557,10 @@ async function ensureWs() {
 
     if (msg.type === 'interrupted') {
       log(`Interrupted (${msg.source || ''})`);
+      lastServerOutputAt = 0;
+      lastServerAudioAt = 0;
+      vadActiveMs = 0;
+      aggressiveVadMs = 0;
       updateUIState(AgentState.INTERRUPTED);
       stopPlayback();
       updateUIState(AgentState.LISTENING);
