@@ -43,7 +43,7 @@ flowchart TB
   end
 
   subgraph Storage Layer
-    Tmp[/Ephemeral Artifact Storage<br/>/tmp screenshots]
+    Tmp[Ephemeral Artifact Storage<br/>/tmp screenshots]
   end
 
   U --> C
