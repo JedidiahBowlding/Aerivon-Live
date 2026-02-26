@@ -39,7 +39,9 @@ def _render_page(name: str) -> str:
         return html
 
     inject = f"<script>window.AERIVON_BACKEND_BASE={BACKEND_BASE!r};</script>\n"
-    if "window.AERIVON_BACKEND_BASE" in html:
+    
+    # Check if the injection script is already present (not just a reference to the variable)
+    if f"<script>window.AERIVON_BACKEND_BASE=" in html:
         return html
 
     if "</head>" in html:
