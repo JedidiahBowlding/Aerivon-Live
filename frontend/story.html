@@ -252,9 +252,6 @@
       color: #e8dfc8;
     }
 
-    /* Audio player (hidden, just for autoplay) */
-    #audioPlayer { display: none; }
-
     /* Empty state */
     #emptyState {
       text-align: center;
@@ -304,8 +301,6 @@
   </div>
 </div>
 
-<audio id="audioPlayer" autoplay></audio>
-
 <script>
   const tellBtn = document.getElementById('tellBtn');
   const stopBtn = document.getElementById('stopBtn');
@@ -314,7 +309,17 @@
   const statusText = document.getElementById('statusText');
   const storyEl = document.getElementById('story');
   const emptyState = document.getElementById('emptyState');
-  const audioPlayer = document.getElementById('audioPlayer');
+
+  // Web Audio API for PCM16 playback
+  let audioContext = null;
+  let currentAudioSource = null;
+
+  function initAudioContext() {
+    if (!audioContext) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    }
+    return audioContext;
+  }
 
   // Example chips
   document.querySelectorAll('.example-chip').forEach(chip => {
@@ -350,22 +355,48 @@
     statusBar.className = 'status-bar' + (mode ? ` ${mode}` : '');
   }
 
-  // Audio queue — play MP3 chunks sequentially
-  async function playAudioChunk(b64) {
-    audioQueue.push(b64);
+  // Audio queue — play PCM16 chunks sequentially using Web Audio API
+  async function playAudioChunk(b64, sampleRate = 24000) {
+    audioQueue.push({ b64, sampleRate });
     if (!audioPlaying) drainAudioQueue();
   }
 
-  function drainAudioQueue() {
+  async function drainAudioQueue() {
     if (audioQueue.length === 0) { audioPlaying = false; return; }
     audioPlaying = true;
-    const b64 = audioQueue.shift();
-    const blob = new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: 'audio/mpeg' });
-    const url = URL.createObjectURL(blob);
-    audioPlayer.src = url;
-    audioPlayer.onended = () => { URL.revokeObjectURL(url); drainAudioQueue(); };
-    audioPlayer.onerror = () => { URL.revokeObjectURL(url); drainAudioQueue(); };
-    audioPlayer.play().catch(() => {});
+    const { b64, sampleRate } = audioQueue.shift();
+    
+    try {
+      const ctx = initAudioContext();
+      
+      // Decode base64 to PCM16 bytes
+      const pcmData = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      
+      // Convert PCM16 (16-bit signed integers) to Float32 for Web Audio
+      const numSamples = pcmData.length / 2;
+      const audioBuffer = ctx.createBuffer(1, numSamples, sampleRate);
+      const channelData = audioBuffer.getChannelData(0);
+      
+      for (let i = 0; i < numSamples; i++) {
+        // Read 16-bit signed integer (little-endian)
+        const int16 = (pcmData[i * 2 + 1] << 8) | pcmData[i * 2];
+        // Convert to signed if necessary
+        const signed = int16 > 32767 ? int16 - 65536 : int16;
+        // Normalize to [-1, 1]
+        channelData[i] = signed / 32768.0;
+      }
+      
+      // Play the audio
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.onended = () => drainAudioQueue();
+      source.start(0);
+      currentAudioSource = source;
+    } catch (err) {
+      console.error('[AUDIO] Playback error:', err);
+      drainAudioQueue(); // Continue queue on error
+    }
   }
 
   // Append a text scene node
@@ -410,8 +441,10 @@
     currentTextEl = null;
     audioQueue = [];
     audioPlaying = false;
-    audioPlayer.pause();
-    audioPlayer.src = '';
+    if (currentAudioSource) {
+      try { currentAudioSource.stop(); } catch (e) {}
+      currentAudioSource = null;
+    }
     currentStoryData = null;
     saveBtn.disabled = true;
   }
@@ -455,7 +488,7 @@
             currentStoryData.scenes.push({ type: 'image', data: msg.data_b64, mimeType: msg.mime_type || 'image/png' });
           }
         } else if (msg.type === 'audio') {
-          playAudioChunk(msg.data_b64);
+          playAudioChunk(msg.data_b64, msg.sample_rate || 24000);
         } else if (msg.type === 'status') {
           if (msg.status === 'done') {
             setStatus('Story complete ✨');
@@ -500,7 +533,10 @@
     }
     audioQueue = [];
     audioPlaying = false;
-    audioPlayer.pause();
+    if (currentAudioSource) {
+      try { currentAudioSource.stop(); } catch (e) {}
+      currentAudioSource = null;
+    }
     setStatus('Stopped');
     tellBtn.disabled = false;
     stopBtn.disabled = true;

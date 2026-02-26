@@ -766,32 +766,56 @@ async def ws_story(websocket: WebSocket) -> None:
         except Exception:
             pass
 
-    # TTS helper — synthesize text to MP3 bytes via Google Cloud TTS
-    async def tts_synthesize(text: str) -> bytes | None:
+    # Live Audio Narration — synthesize text to PCM16 audio via Gemini Live API
+    async def live_narrate(text: str) -> bytes | None:
+        """Use Gemini Live API to narrate text with high-quality voice."""
         text = (text or "").strip()
         if not text or len(text) < 3:
             return None
         try:
-            from google.cloud import texttospeech  # type: ignore
-
-            def _synth() -> bytes:
-                client = texttospeech.TextToSpeechClient()
-                synthesis_input = texttospeech.SynthesisInput(text=text)
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code="en-US",
-                    ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
-                )
-                audio_config = texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.MP3
-                )
-                resp = client.synthesize_speech(
-                    input=synthesis_input, voice=voice, audio_config=audio_config
-                )
-                return bytes(resp.audio_content or b"")
-
-            return await asyncio.to_thread(_synth)
+            client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            
+            def _narrate() -> bytes | None:
+                """Run Live API narration in thread."""
+                try:
+                    # Create a Live session for narration (audio output only)
+                    session = client.live.connect(
+                        model="gemini-2.0-flash-exp",
+                        config=types.LiveConnectConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name="Aoede"  # Warm, storytelling voice
+                                    )
+                                )
+                            ),
+                        ),
+                    )
+                    
+                    # Send text for narration
+                    session.send(text, end_of_turn=True)
+                    
+                    # Collect audio chunks
+                    audio_chunks = []
+                    for response in session.receive():
+                        if response.data:
+                            audio_chunks.append(response.data)
+                        if response.server_content and response.server_content.turn_complete:
+                            break
+                    
+                    if audio_chunks:
+                        # Concatenate all PCM16 chunks
+                        return b"".join(audio_chunks)
+                    return None
+                    
+                except Exception as e:
+                    print(f"[STORY NARRATION] Gemini Live error: {e}", file=sys.stderr)
+                    return None
+            
+            return await asyncio.to_thread(_narrate)
         except Exception as e:
-            print(f"[STORY TTS] Error: {e}", file=sys.stderr)
+            print(f"[STORY NARRATION] Error: {e}", file=sys.stderr)
             return None
 
     # Image generation helper using Imagen 3 via Vertex AI
@@ -916,14 +940,15 @@ async def ws_story(websocket: WebSocket) -> None:
                         await send({"type": "text", "text": text, "index": idx})
 
                     elif part["kind"] == "image":
-                        # Synthesize TTS for accumulated text before this image
+                        # Narrate accumulated text before this image using Gemini Live
                         if pending_text.strip():
-                            audio_bytes = await tts_synthesize(pending_text)
+                            audio_bytes = await live_narrate(pending_text)
                             if audio_bytes:
                                 await send({
                                     "type": "audio",
                                     "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                                    "mime_type": "audio/mpeg",
+                                    "mime_type": "audio/pcm;rate=24000",
+                                    "sample_rate": 24000,
                                     "index": idx,
                                 })
                             pending_text = ""
@@ -935,14 +960,15 @@ async def ws_story(websocket: WebSocket) -> None:
                             "index": idx,
                         })
 
-                # TTS for any trailing text after last image
+                # Narrate any trailing text after last image
                 if pending_text.strip() and not cancel_flag:
-                    audio_bytes = await tts_synthesize(pending_text)
+                    audio_bytes = await live_narrate(pending_text)
                     if audio_bytes:
                         await send({
                             "type": "audio",
                             "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                            "mime_type": "audio/mpeg",
+                            "mime_type": "audio/pcm;rate=24000",
+                            "sample_rate": 24000,
                             "index": 9999,
                         })
 
