@@ -20,6 +20,7 @@ PAGES = {
     "ui_navigator.html",
     "workflow_automator.html",
     "visual_qa.html",
+    "story.html",
 }
 
 BACKEND_BASE = (os.getenv("AERIVON_BACKEND_BASE") or "").strip().rstrip("/")
@@ -89,6 +90,11 @@ def workflow_automator_html() -> HTMLResponse:
 @app.get("/visual_qa.html", response_class=HTMLResponse)
 def visual_qa_html() -> HTMLResponse:
     return HTMLResponse(_render_page("visual_qa.html"))
+
+
+@app.get("/story.html", response_class=HTMLResponse)
+def story_html() -> HTMLResponse:
+    return HTMLResponse(_render_page("story.html"))
 
 
 # Serve static assets (main.js, etc.).
