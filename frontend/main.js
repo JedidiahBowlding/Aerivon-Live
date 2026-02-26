@@ -64,7 +64,8 @@ const AgentState = {
 
 // Very small client-side VAD so Live reliably produces multiple turns.
 // Without explicit audio_end, some Live configs will only answer once (or wait indefinitely).
-const VAD_SPEECH_RMS = 0.010;      // tuned for typical laptop mics; adjust if needed
+// Lowered thresholds for wider mic compatibility (low-volume / aggressive noise suppression setups).
+const VAD_SPEECH_RMS = 0.0025;     // start-of-utterance gate (was 0.010)
 const VAD_SILENCE_MS = 700;        // end-of-utterance after this much silence
 
 // When the model is speaking, the mic may pick up speaker leakage even with echoCancellation.
@@ -76,7 +77,7 @@ const VAD_IDLE_THRESHOLD = 0.010;
 const VAD_SPEAKING_THRESHOLD = 0.018;
 const VAD_TRIGGER_MS = 90;
 const VAD_COOLDOWN_MS = 350;
-const VAD_MIN_TRIGGER_RMS = 0.0030;
+const VAD_MIN_TRIGGER_RMS = 0.0010; // allow barge-in detection at lower levels
 const VAD_MAX_TRIGGER_RMS = 0.020;
 const VAD_NOISE_MULTIPLIER = 2.0;
 const AGGRESSIVE_INTERRUPT_RMS = 0.010;
@@ -92,6 +93,9 @@ let micStream = null;
 let audioCtx = null;
 let processor = null;
 let sourceNode = null;
+let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+let isStoppingMic = false;
 
 let playbackCtx = null;
 let playCursor = 0;
@@ -110,11 +114,45 @@ let suppressOutputUntilConnected = false;
 let pendingTurnComplete = false;
 let lastServerOutputAt = 0;
 let lastServerAudioAt = 0;
+let pendingResumeAfterUpstreamReconnect = false;
 let vadNoiseFloor = 0.0015;
 let aggressiveVadMs = 0;
 let debugPanelEl = null;
 let debugRowsEl = null;
 let lastDebugMicTs = 0;
+
+const UPSTREAM_RESUME_PROMPT = 'Connection restored. Continue only if you were mid-response, otherwise wait for the user.';
+
+function hasActiveMicSession() {
+  return !!(micStream || processor || sourceNode || audioCtx);
+}
+
+function clearWsReconnectTimer() {
+  if (!wsReconnectTimer) return;
+  clearTimeout(wsReconnectTimer);
+  wsReconnectTimer = null;
+}
+
+function scheduleWsReconnect(reason = '') {
+  if (isStoppingMic) return;
+  if (!hasActiveMicSession()) return;
+  if (wsReconnectTimer) return;
+
+  const delayMs = Math.min(4000, 300 * (2 ** Math.min(5, wsReconnectAttempts)));
+  wsReconnectAttempts += 1;
+  log(`WS reconnect scheduled in ${delayMs}ms${reason ? ` reason=${reason}` : ''}`);
+
+  wsReconnectTimer = setTimeout(async () => {
+    wsReconnectTimer = null;
+    if (isStoppingMic || !hasActiveMicSession()) return;
+    try {
+      await ensureWs();
+    } catch (e) {
+      log(`WS reconnect failed: ${e?.message || e}`);
+      scheduleWsReconnect('retry_failed');
+    }
+  }, delayMs);
+}
 
 function ensureInterruptDebugPanel() {
   if (!INTERRUPT_DEBUG || debugPanelEl) return;
@@ -296,7 +334,7 @@ function handleMicFrameForBargeIn(frame, targetWs, source = 'barge-in') {
       {
         source,
         level: level.toFixed(4),
-        thr: dynamicThreshold.toFixed(4),
+        thr: BARGE_IN_RMS.toFixed(4),
         idleThr: dynamicIdleThreshold.toFixed(4),
         noiseFloor: vadNoiseFloor.toFixed(4),
         speakingWindowActive,
@@ -324,8 +362,8 @@ function handleMicFrameForBargeIn(frame, targetWs, source = 'barge-in') {
     return false;
   }
 
-  if (level > dynamicThreshold) vadActiveMs += dt;
-  else if (level < dynamicIdleThreshold) vadActiveMs = Math.max(0, vadActiveMs - dt * 2);
+  if (level > BARGE_IN_RMS) vadActiveMs += dt;
+  else if (level < VAD_IDLE_THRESHOLD) vadActiveMs = Math.max(0, vadActiveMs - dt * 2);
 
   if (vadActiveMs >= VAD_TRIGGER_MS) {
     vadActiveMs = 0;
@@ -680,12 +718,21 @@ function httpBaseToWsBase(httpBase) {
   return base.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
 }
 
+function createLiveMemoryScope() {
+  const suffix = (crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  return `live_agent_${suffix}`;
+}
+
+let currentLiveMemoryScope = createLiveMemoryScope();
+
 function buildWsUrl() {
   const wsBase = httpBaseToWsBase(getBackendHttpBase());
   const url = new URL(`${wsBase}/ws/live`);
   url.searchParams.set('output', 'audio');
   url.searchParams.set('user_id', getOrCreateUserId());
-  url.searchParams.set('memory_scope', 'live_agent');
+  url.searchParams.set('memory_scope', currentLiveMemoryScope);
   return url.toString();
 }
 
@@ -1051,14 +1098,21 @@ async function ensureWs() {
   ws = new WebSocket(url);
 
   ws.onopen = () => {
+    clearWsReconnectTimer();
+    wsReconnectAttempts = 0;
     setStatus('connected');
     log('WS connected');
   };
 
   ws.onclose = (evt) => {
+    const shouldReconnect = !isStoppingMic && hasActiveMicSession() && evt.code !== 1000;
+    ws = null;
     setStatus('disconnected', true);
     updateUIState(AgentState.IDLE);
     log(`WS closed code=${evt.code} reason=${evt.reason || '(none)'}`);
+    if (shouldReconnect) {
+      scheduleWsReconnect(`close_${evt.code}`);
+    }
   };
 
   ws.onerror = () => {
@@ -1079,6 +1133,9 @@ async function ensureWs() {
         lastServerAudioAt = 0;
         vadActiveMs = 0;
         aggressiveVadMs = 0;
+        // Resume prompt removed: causes model to repeat completed responses.
+        // Instead, let silence happen naturally; user will speak when ready.
+        pendingResumeAfterUpstreamReconnect = false;
       } else if (serverSessionId != null && typeof msg.session_id === 'number' && msg.session_id !== serverSessionId) {
         return;
       } else if (serverSessionId != null && msg.type !== 'status' && msg.type !== 'error' && typeof msg.session_id !== 'number') {
@@ -1098,7 +1155,13 @@ async function ensureWs() {
           lastServerAudioAt = 0;
           vadActiveMs = 0;
           aggressiveVadMs = 0;
-          stopPlayback();
+          const restartingReason = String(msg.reason || '').trim();
+          const hadRecentModelAudio = isAudioPlayingOrQueued()
+            || agentState === AgentState.SPEAKING;
+          pendingResumeAfterUpstreamReconnect = restartingReason === 'upstream_disconnected' && hadRecentModelAudio;
+          if (restartingReason !== 'upstream_disconnected') {
+            stopPlayback();
+          }
           setState('thinking');
           return;
         }
@@ -1146,6 +1209,7 @@ async function ensureWs() {
       if (msg.type === 'interrupted') {
         log(`server reports interrupted${msg.source ? ` source=${msg.source}` : ''}`);
         suppressOutputUntilConnected = true;
+        pendingResumeAfterUpstreamReconnect = false;
         lastServerOutputAt = 0;
         lastServerAudioAt = 0;
         vadActiveMs = 0;
@@ -1176,6 +1240,8 @@ async function ensureWs() {
 }
 
 async function startMic() {
+  isStoppingMic = false;
+  currentLiveMemoryScope = createLiveMemoryScope();
   await ensureWs();
 
   micStream = await navigator.mediaDevices.getUserMedia({
@@ -1204,7 +1270,9 @@ async function startMic() {
     // enough silence after speech, send audio_end to close the utterance.
     const level = rms(down);
     const t = performance.now();
-    const speakingNow = level >= VAD_SPEECH_RMS;
+    // Use a dynamic threshold that adapts to the learned noise floor so quieter mics still trigger.
+    const dynamicSpeechThr = Math.max(VAD_SPEECH_RMS, vadNoiseFloor * VAD_NOISE_MULTIPLIER);
+    const speakingNow = level >= dynamicSpeechThr;
 
     if (speakingNow) {
       lastVoiceMs = t;
@@ -1251,6 +1319,8 @@ async function startMic() {
 }
 
 async function stopMic() {
+  isStoppingMic = true;
+  clearWsReconnectTimer();
   try {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'audio_end' }));
@@ -1279,6 +1349,7 @@ async function stopMic() {
   sourceNode = null;
   micStream = null;
   audioCtx = null;
+  pendingResumeAfterUpstreamReconnect = false;
 
   startBtn.disabled = false;
   stopBtn.disabled = true;
@@ -1294,6 +1365,7 @@ async function stopMic() {
   } catch {
     // ignore
   }
+  isStoppingMic = false;
 }
 
 if (HAS_LIVE_AGENT_UI) {

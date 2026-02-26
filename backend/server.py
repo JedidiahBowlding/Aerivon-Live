@@ -1139,9 +1139,44 @@ async def ws_live(websocket: WebSocket) -> None:
 
     async def run_one_session() -> bool:
         """Return True to restart (interrupt/upstream drop), False to stop."""
-        nonlocal session_seq
+        nonlocal session_seq, user_memory
         session_seq += 1
         session_id = session_seq
+
+        # Reload memory from GCS before starting each session so restarts pick up saved context.
+        if mode != "stt":
+            user_memory = await _load_user_memory(user_id=memory_user_id)
+            memory_prompt = _memory_to_prompt(user_memory)
+            sys_instr = "You are Aerivon Live. Be concise and helpful."
+            if memory_prompt:
+                sys_instr = (
+                    f"{sys_instr}\n\n{memory_prompt}\n\n"
+                    "IMPORTANT: This is a continuing conversation. The user's voice input was transcribed as '(voice message)' above, "
+                    "but your PREVIOUS responses reveal what they asked. Use your past responses to infer the conversation context. "
+                    "If asked what they said before, reconstruct it from your own previous answers."
+                )
+            
+            # Rebuild session config with fresh memory.
+            def _build_config(response_modalities: list[types.Modality]) -> types.LiveConnectConfig:
+                gen_cfg = types.GenerationConfig(
+                    max_output_tokens=AERIVON_LIVE_MAX_OUTPUT_TOKENS,
+                    temperature=AERIVON_LIVE_TEMPERATURE,
+                )
+                base_kwargs: dict[str, Any] = {
+                    "system_instruction": sys_instr,
+                    "response_modalities": response_modalities,
+                }
+                if response_modalities == [types.Modality.AUDIO]:
+                    base_kwargs["speech_config"] = speech_config
+                    base_kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
+                try:
+                    return types.LiveConnectConfig(**base_kwargs, generation_config=gen_cfg)
+                except TypeError:
+                    return types.LiveConnectConfig(**base_kwargs)
+            
+            current_session_config = _build_config([types.Modality.AUDIO] if output_mode == "audio" else [types.Modality.TEXT])
+        else:
+            current_session_config = session_config
 
         async def ws_send(payload: dict[str, Any]) -> None:
             payload.setdefault("session_id", session_id)
@@ -1184,7 +1219,7 @@ async def ws_live(websocket: WebSocket) -> None:
             user_memory = mem
             await _save_user_memory(user_id=memory_user_id, memory=mem)
 
-        async with client.aio.live.connect(model=model, config=session_config) as stream:
+        async with client.aio.live.connect(model=model, config=current_session_config) as stream:
             await ws_send(
                 {
                     "type": "status",
@@ -1276,6 +1311,13 @@ async def ws_live(websocket: WebSocket) -> None:
             recv_task = asyncio.create_task(recv_loop())
 
             async def restart(reason: str, detail: str = "") -> bool:
+                # Save any partial exchange BEFORE restarting to preserve memory across upstream disconnects.
+                if reason != "client_interrupt":
+                    try:
+                        await persist_exchange_if_any()
+                    except Exception:
+                        pass  # Don't block restart on memory save failure
+                
                 await ws_send(
                     {
                         "type": "status",
