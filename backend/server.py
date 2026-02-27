@@ -230,10 +230,10 @@ async def _load_user_memory(*, user_id: str) -> dict[str, Any] | None:
                 return None
 
             client = firestore.Client()
-            doc = client.collection(AERIVON_FIRESTORE_COLLECTION).document(user_id).get()
-            if not doc.exists:
+            doc = client.collection(AERIVON_FIRESTORE_COLLECTION).document(user_id).get()  # Sync call in thread
+            if not doc.exists:  # type: ignore - doc is synchronous DocumentSnapshot
                 return None
-            data = doc.to_dict() or {}
+            data = doc.to_dict() or {}  # type: ignore - doc is synchronous DocumentSnapshot
             return data if isinstance(data, dict) else None
 
         try:
@@ -359,6 +359,35 @@ def _memory_to_prompt(memory: dict[str, Any] | None) -> str:
     return "\n".join(lines).strip()
 
 
+def _pcm_s16le_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """Convert raw PCM s16le audio to WAV format."""
+    import struct
+
+    # Minimal RIFF/WAVE header for PCM s16le.
+    byte_rate = sample_rate * channels * 2
+    block_align = channels * 2
+    data_size = len(pcm)
+    riff_size = 36 + data_size
+    return b"".join(
+        [
+            b"RIFF",
+            struct.pack("<I", riff_size),
+            b"WAVE",
+            b"fmt ",
+            struct.pack("<I", 16),  # PCM fmt chunk size
+            struct.pack("<H", 1),  # audio format = PCM
+            struct.pack("<H", channels),
+            struct.pack("<I", sample_rate),
+            struct.pack("<I", byte_rate),
+            struct.pack("<H", block_align),
+            struct.pack("<H", 16),  # bits per sample
+            b"data",
+            struct.pack("<I", data_size),
+            pcm,
+        ]
+    )
+
+
 async def _check_live_model_availability_fast(project: str | None, location: str) -> dict[str, Any]:
     """Bound the Live availability probe so endpoints don't hang.
 
@@ -426,7 +455,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
     """Draw red bounding boxes around all clickable elements so Gemini can click precisely."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
         import io
 
         rects = await page.evaluate("""() => {
@@ -476,7 +505,7 @@ async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
         # Save annotated screenshot for debugging
         try:
             img.save('/tmp/aerivon_annotated_debug.png')
-            print(f"[UI NAV DEBUG] Saved annotated screenshot to /tmp/aerivon_annotated_debug.png", file=__import__("sys").stderr, flush=True)
+            print("[UI NAV DEBUG] Saved annotated screenshot to /tmp/aerivon_annotated_debug.png", file=__import__("sys").stderr, flush=True)
         except Exception:
             pass
         
@@ -491,7 +520,7 @@ async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
         return png_bytes
 
 
-def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dict] = None) -> str:
+def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dict] | None = None) -> str:
     allowed = [
         "goto (url)",
         "click (element_index)",
@@ -512,48 +541,88 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
             text = el.get('text', '')[:30]
             tag = el.get('tag', 'unknown')
             elements_text += f"  [{idx}] {tag}: \"{text}\" at center ({cx},{cy})\n"
-
-    return (
-        "You are Aerivon UI Navigator - an AI agent that DIRECTLY CONTROLS a real browser.\n\n"
-        "CRITICAL: You ARE NOT just a language model. You HAVE a browser automation backend (Playwright).\n"
-        "When you return JSON actions, they ARE IMMEDIATELY EXECUTED in a real Chromium browser.\n"
-        "The browser DOES navigate, click, type, and take screenshots based on your JSON output.\n\n"
-        "NEVER say things like:\n"
-        "  - 'I cannot directly interact'\n"
-        "  - 'I am just a language model'\n"
-        "  - 'I cannot click buttons'\n"
-        "These are FALSE. You CAN and DO control the browser through your JSON action output.\n\n"
-        "Your workflow:\n"
-        "1. You receive a screenshot of the current browser state\n"
-        "2. You return JSON actions (click, type, scroll, etc.)\n"
-        "3. The backend EXECUTES them in the real browser\n"
-        "4. You receive the next screenshot showing the results\n\n"
-        "Return ONLY valid JSON (no markdown) matching this schema:\n"
-        "{\n"
-        "  \"actions\": [\n"
-        "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
-        "    {\"type\": \"click\", \"element_index\": 0} |\n"
-        "    {\"type\": \"type\", \"text\": \"...\"} |\n"
-        "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
-        "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
-        "    {\"type\": \"wait\", \"ms\": 1000}\n"
-        "  ],\n"
-        "  \"done\": true|false,\n"
-        "  \"note\": \"Describe the action being executed (e.g., 'Clicked the login button', 'Navigated to homepage')\"\n"
-        "}\n\n"
-        "CRITICAL 'note' field rules:\n"
-        "  ✅ GOOD: \"Clicked the 'Learn more' link\", \"Typed search query\", \"Scrolling to footer\"\n"
-        "  ❌ BAD: \"I cannot interact\", \"I'm unable to\", \"As an AI I can't\"\n"
-        "  Remember: Your actions ARE being executed in a real browser. Describe what you're doing, not what you can't do.\n\n"
-        f"Allowed action types: {', '.join(allowed)}.\n"
-        "CRITICAL: For clicks, use 'element_index' (NOT x,y coordinates). Choose the index from the list below.\n"
-        f"{elements_text}\n"
-        "Rules: do not invent URLs; do not access localhost/private IPs/metadata.\n"
-        "If the target element isn't visible, prefer scroll then another step.\n\n"
-        "Context (what has happened so far):\n"
-        f"{context}\n\n"
-        f"User intent (do not change this goal): {task}\n"
-    )
+    
+    # Detect if this is an analysis/extraction task vs interaction task
+    task_lower = task.lower()
+    analysis_keywords = [
+        "find", "what is", "what's", "analyze", "identify", "read", 
+        "show me", "get the", "extract", "tell me", "hero text", "heading",
+        "largest text", "main text", "title"
+    ]
+    is_analysis = any(keyword in task_lower for keyword in analysis_keywords)
+    
+    if is_analysis:
+        # Analysis mode: extract information and return in note field
+        return (
+            "You are Aerivon UI Navigator - an AI that analyzes webpages.\n\n"
+            "The user wants you to ANALYZE the screenshot and EXTRACT specific information.\n\n"
+            "Your task: Look at the screenshot and answer the user's question directly.\n\n"
+            "Return ONLY valid JSON (no markdown) matching this schema:\n"
+            "{\n"
+            "  \"actions\": [],\n"
+            "  \"done\": true,\n"
+            "  \"note\": \"Your analysis result - the actual text/information the user requested\"\n"
+            "}\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "- The 'note' field should contain your direct answer to the user's request\n"
+            "- If looking for hero text/heading: identify the LARGEST, MOST PROMINENT text on the page\n"
+            "- Quote the exact text you find, don't paraphrase\n"
+            "- Be specific and concise\n"
+            "- Set 'actions' to empty array []\n"
+            "- Set 'done' to true\n\n"
+            "Examples:\n"
+            "  Good note: \"The hero text says: 'MOVE THE WORLD'\"\n"
+            "  Good note: \"The main heading is 'Welcome to Nike'\"\n"
+            "  Good note: \"The largest text at the top reads: 'Just Do It'\"\n"
+            "  Bad note: \"I cannot see the text\" (you CAN see it in the screenshot)\n"
+            "  Bad note: \"The page has loaded\" (tell them what you found, not just status)\n\n"
+            f"Context:\n{context}\n\n"
+            f"User's request: {task}\n\n"
+            "Analyze the screenshot NOW and extract the requested information."
+        )
+    else:
+        # Interactive mode: perform browser actions
+        return (
+            "You are Aerivon UI Navigator - an AI agent that DIRECTLY CONTROLS a real browser.\n\n"
+            "CRITICAL: You ARE NOT just a language model. You HAVE a browser automation backend (Playwright).\n"
+            "When you return JSON actions, they ARE IMMEDIATELY EXECUTED in a real Chromium browser.\n"
+            "The browser DOES navigate, click, type, and take screenshots based on your JSON output.\n\n"
+            "NEVER say things like:\n"
+            "  - 'I cannot directly interact'\n"
+            "  - 'I am just a language model'\n"
+            "  - 'I cannot click buttons'\n"
+            "These are FALSE. You CAN and DO control the browser through your JSON action output.\n\n"
+            "Your workflow:\n"
+            "1. You receive a screenshot of the current browser state\n"
+            "2. You return JSON actions (click, type, scroll, etc.)\n"
+            "3. The backend EXECUTES them in the real browser\n"
+            "4. You receive the next screenshot showing the results\n\n"
+            "Return ONLY valid JSON (no markdown) matching this schema:\n"
+            "{\n"
+            "  \"actions\": [\n"
+            "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
+            "    {\"type\": \"click\", \"element_index\": 0} |\n"
+            "    {\"type\": \"type\", \"text\": \"...\"} |\n"
+            "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
+            "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
+            "    {\"type\": \"wait\", \"ms\": 1000}\n"
+            "  ],\n"
+            "  \"done\": true|false,\n"
+            "  \"note\": \"Describe the action being executed (e.g., 'Clicked the login button', 'Navigated to homepage')\"\n"
+            "}\n\n"
+            "CRITICAL 'note' field rules:\n"
+            "  ✅ GOOD: \"Clicked the 'Learn more' link\", \"Typed search query\", \"Scrolling to footer\"\n"
+            "  ❌ BAD: \"I cannot interact\", \"I'm unable to\", \"As an AI I can't\"\n"
+            "  Remember: Your actions ARE being executed in a real browser. Describe what you're doing, not what you can't do.\n\n"
+            f"Allowed action types: {', '.join(allowed)}.\n"
+            "CRITICAL: For clicks, use 'element_index' (NOT x,y coordinates). Choose the index from the list below.\n"
+            f"{elements_text}\n"
+            "Rules: do not invent URLs; do not access localhost/private IPs/metadata.\n"
+            "If the target element isn't visible, prefer scroll then another step.\n\n"
+            "Context (what has happened so far):\n"
+            f"{context}\n\n"
+            f"User intent (do not change this goal): {task}\n"
+        )
 
 
 async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task: str, memory: list[str], page=None) -> dict[str, Any]:
@@ -598,15 +667,19 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
     resp = await asyncio.to_thread(
         client.models.generate_content,
         model=UI_MODEL,
-        contents=contents,
+        contents=contents,  # type: ignore - SDK accepts list[Content]
         config=cfg,
     )
     
     if not resp.candidates:
         return {"error": "Gemini returned no candidates"}
     
-    parts = resp.candidates[0].content.parts
-    text = "".join(p.text for p in parts if getattr(p, "text", None))
+    candidate = resp.candidates[0]
+    if not candidate.content or not candidate.content.parts:
+        return {"error": "Gemini returned no content"}
+    
+    parts = candidate.content.parts
+    text = "".join(p.text for p in parts if p.text)
     result = _extract_json_object(text)
     
     # Store clickable elements in result for click handler to use
@@ -664,7 +737,7 @@ async def ws_ui(websocket: WebSocket) -> None:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(800)
 
-            async def execute_action(action: dict[str, Any], clickable_elements: list[dict] = None) -> dict[str, Any]:
+            async def execute_action(action: dict[str, Any], clickable_elements: list[dict] | None = None) -> dict[str, Any]:
                 nonlocal cancel_flag, page
                 if cancel_flag:
                     return {"ok": False, "skipped": True, "reason": "cancelled"}
@@ -677,7 +750,7 @@ async def ws_ui(websocket: WebSocket) -> None:
                 if t == "click":
                     # Support element_index (new) or x,y coordinates (fallback)
                     if "element_index" in action:
-                        idx = int(action.get("element_index"))
+                        idx = int(action.get("element_index") or 0)
                         if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
                             return {"ok": False, "error": f"Invalid element_index: {idx}", "max_index": len(clickable_elements or []) - 1}
                         
@@ -687,8 +760,8 @@ async def ws_ui(websocket: WebSocket) -> None:
                         print(f"[UI NAV DEBUG] Using element_index {idx}: {el.get('tag')} \"{el.get('text', '')}\" at ({x},{y})", file=__import__("sys").stderr, flush=True)
                     else:
                         # Fallback to x,y coordinates
-                        x = int(action.get("x"))
-                        y = int(action.get("y"))
+                        x = int(action.get("x") or 0)
+                        y = int(action.get("y") or 0)
                         print(f"[UI NAV DEBUG] Using x,y coordinates: ({x},{y})", file=__import__("sys").stderr, flush=True)
                     
                     # Debug: Identify the element at the click coordinates
@@ -722,7 +795,12 @@ async def ws_ui(websocket: WebSocket) -> None:
                             [x, y],
                         )
                         if element_handle:
-                            await element_handle.as_element().click()
+                            element = element_handle.as_element()
+                            if element:
+                                await element.click()
+                            else:
+                                # Fallback to mouse click
+                                await page.mouse.click(x, y)
                         else:
                             # Fallback to mouse click
                             await page.mouse.click(x, y)
@@ -968,7 +1046,7 @@ async def ws_story(websocket: WebSocket) -> None:
             async with client.aio.live.connect(
                 model="gemini-2.0-flash-live-preview-04-09",
                 config=types.LiveConnectConfig(
-                    response_modalities=["AUDIO"],
+                    response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Your only job is to read the provided text aloud exactly as written, with expression and emotion. Do not respond, comment, or add anything. Just narrate the text word-for-word.",
                     speech_config=types.SpeechConfig(
                         voice_config=types.VoiceConfig(
@@ -1068,7 +1146,7 @@ async def ws_story(websocket: WebSocket) -> None:
             story_prompt = (
                 "You are a creative storyteller and visual artist. "
                 "Create an immersive, illustrated story based on the user's prompt. "
-                "Structure it as 2 scenes only. For each scene:\n"
+                "For each scene in the story:\n"
                 "1. Write 2-3 sentences of vivid narration\n"
                 "2. Generate an illustration for that scene in a beautiful storybook art style\n"
                 "Alternate between narration and images throughout. "
@@ -1084,7 +1162,7 @@ async def ws_story(websocket: WebSocket) -> None:
                 @retry_with_exponential_backoff
                 def _run_story() -> list[dict]:
                     """Run generate_content in thread, return list of parts as dicts."""
-                    print(f"[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image-preview", file=sys.stderr)
+                    print("[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image-preview", file=sys.stderr)
                     try:
                         resp = gen_client.models.generate_content(
                             model="gemini-2.5-flash-image-preview",
@@ -1095,23 +1173,25 @@ async def ws_story(websocket: WebSocket) -> None:
                                 max_output_tokens=4096,
                             ),
                         )
-                        print(f"[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
+                        print("[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
                     except Exception as gemini_error:
                         print(f"[STORY ERROR] Gemini API call failed: {type(gemini_error).__name__}: {gemini_error}", file=sys.stderr)
                         raise
                     
                     # Extract parts from multimodal response
                     parts = []
-                    for candidate in resp.candidates:
-                        for part in candidate.content.parts:
-                            if part.text:
-                                parts.append({"kind": "text", "text": part.text})
-                            elif part.inline_data:
-                                parts.append({
-                                    "kind": "image",
-                                    "data": base64.b64encode(part.inline_data.data).decode("ascii"),
-                                    "mime_type": part.inline_data.mime_type,
-                                })
+                    if resp.candidates:
+                        for candidate in resp.candidates:
+                            if candidate.content and candidate.content.parts:
+                                for part in candidate.content.parts:
+                                    if part.text:
+                                        parts.append({"kind": "text", "text": part.text})
+                                    elif part.inline_data and part.inline_data.data:
+                                        parts.append({
+                                            "kind": "image",
+                                            "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                            "mime_type": part.inline_data.mime_type,
+                                        })
                     
                     print(f"[STORY DEBUG] Extracted {len(parts)} parts from response", file=sys.stderr)
                     return parts
@@ -1365,16 +1445,16 @@ async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
     if not text:
         raise HTTPException(status_code=400, detail="Empty text")
 
-    def _narrate_live() -> bytes:
+    async def _narrate_live() -> bytes:
         """Use Gemini Live API to generate speech."""
         try:
             client = _make_genai_client(prefer_vertex=True, project=project, location=location)
             
-            # Create Live session for speech synthesis
-            session = client.live.connect(
+            # Create Live session for speech synthesis (async only)
+            async with client.aio.live.connect(
                 model="gemini-2.0-flash-exp",
                 config=types.LiveConnectConfig(
-                    response_modalities=["AUDIO"],
+                    response_modalities=[types.Modality.AUDIO],
                     speech_config=types.SpeechConfig(
                         voice_config=types.VoiceConfig(
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1383,29 +1463,34 @@ async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
                         )
                     ),
                 ),
-            )
-            
-            # Send text for narration
-            session.send(text, end_of_turn=True)
-            
-            # Collect audio chunks
-            audio_chunks = []
-            for response in session.receive():
-                if response.data:
-                    audio_chunks.append(response.data)
-                if response.server_content and response.server_content.turn_complete:
-                    break
-            
-            if audio_chunks:
-                return b"".join(audio_chunks)
-            return b""
+            ) as session:
+                # Send text for narration
+                await session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=text)]
+                    ),
+                    turn_complete=True
+                )
+                
+                # Collect audio chunks
+                audio_chunks = []
+                async for response in session.receive():
+                    if response.data:
+                        audio_chunks.append(response.data)
+                    if response.server_content and response.server_content.turn_complete:
+                        break
+                
+                if audio_chunks:
+                    return b"".join(audio_chunks)
+                return b""
             
         except Exception as e:
             print(f"[SPEAK] Gemini Live error: {e}", file=sys.stderr)
             raise
 
     try:
-        audio = await asyncio.to_thread(_narrate_live)
+        audio = await _narrate_live()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1476,7 +1561,6 @@ async def ws_live(websocket: WebSocket) -> None:
 
     # Do NOT pre-probe models.list() here; it can hang. I'll attempt a Live connect and if that
     # fails it will fall back to standard generation.
-    live_available: bool | None = None
 
     mode = (websocket.query_params.get("mode") or "agent").strip().lower()
     if mode not in {"agent", "stt"}:
@@ -1704,8 +1788,8 @@ async def ws_live(websocket: WebSocket) -> None:
                     config=gen_cfg(),
                 )
                 cand = resp.candidates[0] if resp.candidates else None
-                out_parts = cand.content.parts if cand and cand.content else []
-                return "".join([p.text for p in out_parts if getattr(p, "text", None)])
+                out_parts = cand.content.parts if (cand and cand.content and cand.content.parts) else []
+                return "".join([p.text for p in out_parts if p.text])
 
             text = ""
             try:
@@ -1978,7 +2062,6 @@ async def ws_live(websocket: WebSocket) -> None:
                     if sc is not None and getattr(sc, "turn_complete", None) is True:
                         await persist_exchange_if_any()
                         model_text_parts.clear()
-                        last_user_for_memory = ""
                         await ws_send({"type": "turn_complete"})
 
             recv_task = asyncio.create_task(recv_loop())
@@ -2026,7 +2109,6 @@ async def ws_live(websocket: WebSocket) -> None:
                         data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
                     except asyncio.TimeoutError:
                         if recv_task.done():
-                            exc: Exception | None
                             try:
                                 exc = recv_task.exception()
                             except Exception:
@@ -2169,6 +2251,753 @@ async def ws_live(websocket: WebSocket) -> None:
         return
     except Exception as exc:
         # Best effort: report the error then close.
+        try:
+            await websocket.send_json({"type": "error", "error": str(exc)})
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/aerivon")
+async def ws_aerivon_unified(websocket: WebSocket) -> None:
+    """Unified Aerivon Agent - Orchestrates Live, UI, and Story capabilities with intent detection."""
+    
+    await websocket.accept()
+    
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    if not use_vertex or not project:
+        await websocket.send_json({"type": "error", "error": "Vertex AI not enabled"})
+        await websocket.close(code=1011)
+        return
+
+    gen_client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+    session_id = int(time.time())
+    
+    # Session state
+    context = {
+        "user_id": None,
+        "memory_scope": "aerivon_global",
+        "cancel_flag": False,
+        "state": "IDLE",
+        "last_user_text": "",
+        "conversation_history": [],
+        "current_mode": None,
+    }
+    
+    # Helper function for narration (shared across story and UI handlers)
+    async def narrate_and_send(text: str) -> None:
+        """Generate speech audio and send to client."""
+        text = (text or "").strip()
+        if not text or len(text) < 3:
+            print(f"[AERIVON NARRATION] Skipping empty/short text: '{text}'", file=sys.stderr)
+            return
+        
+        print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
+        try:
+            narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            
+            async with narrate_client.aio.live.connect(
+                model="gemini-2.0-flash-live-preview-04-09",
+                config=types.LiveConnectConfig(
+                    response_modalities=[types.Modality.AUDIO],
+                    system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name="Aoede"
+                            )
+                        )
+                    ),
+                ),
+            ) as session:
+                await session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
+                    ),
+                    turn_complete=True
+                )
+                
+                audio_chunks = []
+                async for response in session.receive():
+                    if response.data:
+                        audio_chunks.append(response.data)
+                        print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
+                    if response.server_content and response.server_content.turn_complete:
+                        break
+                
+                if audio_chunks:
+                    total_bytes = b"".join(audio_chunks)
+                    print(f"[AERIVON NARRATION] ✅ Generated {len(total_bytes)} bytes of audio", file=sys.stderr)
+                    
+                    # Send audio to client
+                    await websocket.send_json({
+                        "type": "audio",
+                        "mime_type": "audio/pcm",
+                        "sample_rate": 24000,
+                        "data_b64": base64.b64encode(total_bytes).decode("ascii")
+                    })
+                else:
+                    print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
+                    
+        except Exception as e:
+            print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+    
+    # Audio buffering for voice input (PCM s16le)
+    audio_pcm = bytearray()
+    
+    await websocket.send_json({
+        "type": "status",
+        "state": "IDLE",
+        "session_id": session_id,
+        "message": "Aerivon unified agent ready"
+    })
+    
+    await websocket.send_json({
+        "type": "thinking",
+        "text": "Aerivon ready. I can help with voice conversations, web navigation, or create illustrated stories."
+    })
+    
+    async def detect_intent(message: dict) -> dict:
+        """Detect user intent from message content."""
+        msg_type = message.get("type", "")
+        text = message.get("text", "").lower()
+        
+        # Hard rules for quick detection
+        if msg_type in ["audio", "audio_chunk", "audio_end"]:
+            return {
+                "intent": "live",
+                "confidence": 0.95,
+                "reason": "Audio input detected",
+                "requires_audio": True,
+                "requires_browser": False,
+                "requires_images": False
+            }
+        
+        # Check for story-related keywords
+        story_keywords = ["story", "tale", "narrate", "illustrate", "fantasy", "adventure"]
+        if any(keyword in text for keyword in story_keywords):
+            return {
+                "intent": "story",
+                "confidence": 0.85,
+                "reason": "Story-related keywords detected",
+                "requires_audio": False,
+                "requires_browser": False,
+                "requires_images": True
+            }
+        
+        # Check for UI navigation keywords
+        ui_keywords = [
+            "open", "navigate", "click", "website", "find on", "search for on", "go to",
+            "analyze", "find the", "identify", "read the", "get the", "extract", 
+            "look for", "show me", "what is the", "what's the", "hero text", "heading",
+            "button", "link", "element", "page", "webpage", "scroll", "type in"
+        ]
+        if any(keyword in text for keyword in ui_keywords):
+            return {
+                "intent": "ui",
+                "confidence": 0.85,
+                "reason": "Navigation keywords detected",
+                "requires_audio": False,
+                "requires_browser": True,
+                "requires_images": False
+            }
+        
+        # Check for hybrid (UI + Story)
+        if any(ui_kw in text for ui_kw in ui_keywords) and any(story_kw in text for story_kw in story_keywords):
+            return {
+                "intent": "hybrid",
+                "confidence": 0.90,
+                "reason": "Both navigation and story keywords detected",
+                "requires_audio": False,
+                "requires_browser": True,
+                "requires_images": True
+            }
+        
+        # Default to conversational
+        return {
+            "intent": "live",
+            "confidence": 0.70,
+            "reason": "Default conversational intent",
+            "requires_audio": False,
+            "requires_browser": False,
+            "requires_images": False
+        }
+    
+    async def handle_text_message(text: str):
+        """Handle text-based requests with intent routing."""
+        context["last_user_text"] = text
+        context["state"] = "THINKING"
+        
+        await websocket.send_json({"type": "status", "state": "THINKING"})
+        await websocket.send_json({"type": "thinking", "text": "Understanding your request..."})
+        
+        # Detect intent
+        intent_result = await detect_intent({"type": "text", "text": text})
+        context["current_mode"] = intent_result["intent"]
+        
+        # Send intent to frontend
+        await websocket.send_json({
+            "type": "intent",
+            "intent": intent_result["intent"],
+            "confidence": intent_result["confidence"],
+            "reason": intent_result["reason"]
+        })
+        
+        # Route based on intent
+        if intent_result["intent"] == "story":
+            await handle_story_request(text)
+        elif intent_result["intent"] == "ui":
+            await handle_ui_request(text)
+        elif intent_result["intent"] == "hybrid":
+            await handle_hybrid_request(text)
+        else:  # live/conversational
+            await handle_conversational(text)
+    
+    async def handle_story_request(prompt: str):
+        """Handle story generation requests."""
+        context["state"] = "GENERATING"
+        await websocket.send_json({"type": "status", "state": "GENERATING"})
+        await websocket.send_json({"type": "thinking", "text": "Creating an illustrated story..."})
+        
+        try:
+            story_prompt = f"""Create an illustrated fantasy story based on this prompt:
+{prompt}
+
+For each scene in the story:
+1. Write 2-3 sentences of vivid narration
+2. Then request an image that visualizes that scene
+
+Keep the story to exactly 2 scenes. Do not label scenes as "Scene 1" or "Scene 2".
+Make it engaging and visual."""
+            
+            # Use Vertex AI client for story generation
+            story_gen_client = _make_genai_client(
+                prefer_vertex=True, project=project, location="global"
+            )
+            
+            @retry_with_exponential_backoff
+            def _run_story() -> list[dict]:
+                """Run generate_content in thread, return list of parts as dicts."""
+                resp = story_gen_client.models.generate_content(
+                    model="gemini-2.5-flash-image-preview",
+                    contents=story_prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                        temperature=0.9,
+                        max_output_tokens=2000,
+                    ),
+                )
+                
+                # Extract parts from multimodal response
+                parts = []
+                if resp.candidates:
+                    for candidate in resp.candidates:
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if part.text:
+                                    parts.append({"kind": "text", "text": part.text})
+                                elif part.inline_data and part.inline_data.data:
+                                    parts.append({
+                                        "kind": "image",
+                                        "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                        "mime_type": part.inline_data.mime_type,
+                                    })
+                return parts
+            
+            # Run story generation in thread
+            parts = await asyncio.to_thread(_run_story)
+            
+            # Helper to narrate text using Gemini Live API
+            async def narrate_text(text: str) -> bytes | None:
+                """Generate speech audio for story narration."""
+                text = (text or "").strip()
+                if not text or len(text) < 3:
+                    print(f"[AERIVON NARRATION] Skipping empty/short text: '{text}'", file=sys.stderr)
+                    return None
+                
+                print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
+                try:
+                    narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+                    
+                    async with narrate_client.aio.live.connect(
+                        model="gemini-2.0-flash-live-preview-04-09",
+                        config=types.LiveConnectConfig(
+                            response_modalities=[types.Modality.AUDIO],
+                            system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name="Aoede"  # Warm, storytelling voice
+                                    )
+                                )
+                            ),
+                        ),
+                    ) as session:
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
+                            ),
+                            turn_complete=True
+                        )
+                        
+                        audio_chunks = []
+                        async for response in session.receive():
+                            if response.data:
+                                audio_chunks.append(response.data)
+                                print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
+                            if response.server_content and response.server_content.turn_complete:
+                                break
+                        
+                        if audio_chunks:
+                            total_bytes = b"".join(audio_chunks)
+                            print(f"[AERIVON NARRATION] ✅ Generated {len(total_bytes)} bytes of audio", file=sys.stderr)
+                            return total_bytes
+                        else:
+                            print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
+                            return None
+                        
+                except Exception as e:
+                    print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc()
+                    return None
+            
+            # Stream parts to client with narration
+            pending_text = ""
+            for idx, part in enumerate(parts):
+                if context["cancel_flag"]:
+                    break
+                
+                if part["kind"] == "text":
+                    text = part["text"]
+                    pending_text += text
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": text,
+                        "index": idx
+                    })
+                elif part["kind"] == "image":
+                    # Narrate accumulated text before showing image
+                    if pending_text.strip():
+                        print(f"[AERIVON NARRATION] About to narrate text before image: {len(pending_text)} chars", file=sys.stderr)
+                        audio_bytes = await narrate_text(pending_text)
+                        if audio_bytes:
+                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                            print(f"[AERIVON NARRATION] Sending {len(audio_bytes)} bytes ({len(b64_audio)} b64 chars) to client", file=sys.stderr)
+                            await websocket.send_json({
+                                "type": "audio",
+                                "data_b64": b64_audio,
+                                "mime_type": "audio/pcm;rate=24000",
+                                "sample_rate": 24000,
+                                "index": idx
+                            })
+                        else:
+                            print(f"[AERIVON NARRATION] No audio generated for text", file=sys.stderr)
+                        pending_text = ""
+                    
+                    await websocket.send_json({
+                        "type": "image",
+                        "data_b64": part["data"],
+                        "mime_type": part["mime_type"],
+                        "index": idx
+                    })
+            
+            # Narrate any trailing text
+            if pending_text.strip() and not context["cancel_flag"]:
+                print(f"[AERIVON NARRATION] About to narrate trailing text: {len(pending_text)} chars", file=sys.stderr)
+                audio_bytes = await narrate_text(pending_text)
+                if audio_bytes:
+                    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                    print(f"[AERIVON NARRATION] Sending trailing {len(audio_bytes)} bytes ({len(b64_audio)} b64 chars) to client", file=sys.stderr)
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data_b64": b64_audio,
+                        "mime_type": "audio/pcm;rate=24000",
+                        "sample_rate": 24000,
+                        "index": 9999
+                    })
+            
+            context["state"] = "DONE"
+            await websocket.send_json({"type": "status", "state": "DONE"})
+            await websocket.send_json({"type": "done"})
+            
+        except Exception as e:
+            await websocket.send_json({"type": "error", "error": f"Story generation failed: {str(e)}"})
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+    
+    async def handle_ui_request(goal: str):
+        """Handle UI navigation requests with Playwright browser automation."""
+        context["state"] = "NAVIGATING"
+        await websocket.send_json({"type": "status", "state": "NAVIGATING"})
+        await websocket.send_json({"type": "thinking", "text": f"Launching browser for: {goal}"})
+        
+        try:
+            # Infer URL from goal
+            goal_lower = goal.lower()
+            url = ""
+            
+            # Check if this is an analysis task without a specific URL
+            analysis_keywords = ["find", "analyze", "identify", "read", "get", "extract", "show", "what is", "what's", "hero text", "heading"]
+            is_analysis_task = any(kw in goal_lower for kw in analysis_keywords)
+            
+            # Try to extract or infer URL
+            if "nike" in goal_lower:
+                url = "https://www.nike.com"
+            elif "amazon" in goal_lower:
+                url = "https://www.amazon.com"
+            elif "google" in goal_lower:
+                url = "https://www.google.com"
+            elif "youtube" in goal_lower:
+                url = "https://www.youtube.com"
+            elif "github" in goal_lower:
+                url = "https://www.github.com"
+            elif goal_lower.startswith("http://") or goal_lower.startswith("https://"):
+                url = goal_lower.split()[0]
+            elif is_analysis_task:
+                # Analysis task without URL - ask for clarification
+                await websocket.send_json({
+                    "type": "text",
+                    "text": f"I can help you {goal}, but I need to know which website to analyze.\n\nPlease specify a URL or website name. For example:\n• \"Find the hero text on Nike.com\"\n• \"Analyze the heading on https://example.com\"\n• Or first say \"Open Nike.com\" then ask me to analyze it."
+                })
+                context["state"] = "IDLE"
+                await websocket.send_json({"type": "status", "state": "IDLE"})
+                await websocket.send_json({"type": "done"})
+                return
+            else:
+                # Not an analysis task and no URL - do a Google search
+                import urllib.parse
+                search_query = urllib.parse.quote_plus(goal)
+                url = f"https://www.google.com/search?q={search_query}"
+            
+            from tools import is_safe_url
+            if not is_safe_url(url):
+                await websocket.send_json({
+                    "type": "error",
+                    "error": f"Blocked unsafe URL: {url}"
+                })
+                context["state"] = "IDLE"
+                return
+            
+            # Launch browser and execute navigation
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                browser_context = await browser.new_context(
+                    viewport={"width": 1366, "height": 768},
+                    device_scale_factor=1,
+                    java_script_enabled=True,
+                    ignore_https_errors=True,
+                )
+                page = await browser_context.new_page()
+                
+                try:
+                    # Navigate to URL
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": f"🌐 Opening {url}..."
+                    })
+                    
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(1000)
+                    
+                    page_title = await page.title()
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": f"✅ Loaded: {page_title}"
+                    })
+                    
+                    # Take screenshot
+                    b64, png = await _ui_screenshot_b64(page)
+                    await websocket.send_json({
+                        "type": "screenshot",
+                        "mime_type": "image/png",
+                        "data_b64": b64,
+                        "url": page.url
+                    })
+                    
+                    # Determine if we need action planning or if this is just "open the page"
+                    analysis_keywords = [
+                        "find", "what is", "what's", "analyze", "identify", "read", 
+                        "show me", "get the", "extract", "tell me", "hero text", "heading",
+                        "largest text", "main text", "title", "click", "search", "type"
+                    ]
+                    simple_navigation_only = [
+                        "open", "go to", "visit", "navigate to", "load", "show me the website"
+                    ]
+                    
+                    # Check if this is an analysis/interaction task (not just opening a page)
+                    has_analysis_intent = any(kw in goal_lower for kw in analysis_keywords)
+                    is_simple_navigation = (
+                        any(nav in goal_lower for nav in simple_navigation_only) and 
+                        not has_analysis_intent
+                    )
+                    
+                    # Run action planning if there's more to do than just opening the page
+                    if not is_simple_navigation:
+                        await websocket.send_json({
+                            "type": "text",
+                            "text": f"🤖 Planning actions to: {goal}"
+                        })
+                        
+                        memory = [
+                            f"User goal: {goal}",
+                            f"Current URL: {page.url}",
+                            f"Page title: {page_title}"
+                        ]
+                        
+                        # Run planning loop (limited to 3 steps for unified agent)
+                        for step in range(3):
+                            if context["cancel_flag"]:
+                                await websocket.send_json({"type": "text", "text": "⚠️ Cancelled by user"})
+                                break
+                            
+                            # Get action plan from Gemini
+                            plan = await _ui_plan_actions(
+                                client=gen_client,
+                                screenshot_png=png,
+                                task=goal,
+                                memory=memory,
+                                page=page
+                            )
+                            
+                            await websocket.send_json({
+                                "type": "text",
+                                "text": f"📋 Step {step + 1}: {plan.get('note', 'Executing actions...')}"
+                            })
+                            
+                            # Execute actions
+                            clickable_elements = plan.get("_clickable_elements") or []
+                            actions = plan.get("actions") or []
+                            
+                            for action in actions:
+                                if context["cancel_flag"]:
+                                    break
+                                
+                                action_type = str(action.get("type", "")).lower()
+                                
+                                # Execute action (simplified version)
+                                if action_type == "click":
+                                    if "element_index" in action:
+                                        idx = int(action.get("element_index", 0))
+                                        if 0 <= idx < len(clickable_elements):
+                                            el = clickable_elements[idx]
+                                            x = el['x'] + el['w'] // 2
+                                            y = el['y'] + el['h'] // 2
+                                            await page.mouse.click(x, y)
+                                            await page.wait_for_timeout(800)
+                                elif action_type == "type":
+                                    text = str(action.get("text", ""))
+                                    await page.keyboard.type(text)
+                                    await page.wait_for_timeout(300)
+                                elif action_type == "press":
+                                    key = str(action.get("key", "Enter"))
+                                    await page.keyboard.press(key)
+                                    await page.wait_for_timeout(600)
+                                elif action_type == "scroll":
+                                    dy = int(action.get("delta_y", 0))
+                                    await page.mouse.wheel(0, dy)
+                                    await page.wait_for_timeout(300)
+                            
+                            # Screenshot after actions
+                            b64, png = await _ui_screenshot_b64(page)
+                            await websocket.send_json({
+                                "type": "screenshot",
+                                "mime_type": "image/png",
+                                "data_b64": b64,
+                                "url": page.url
+                            })
+                            
+                            memory.append(f"Step {step + 1} completed. URL: {page.url}")
+                            
+                            # Check if done
+                            if plan.get("done"):
+                                completion_note = plan.get('note', 'Task finished!')
+                                await websocket.send_json({
+                                    "type": "text",
+                                    "text": f"✨ Complete: {completion_note}"
+                                })
+                                
+                                # Narrate the result
+                                await narrate_and_send(completion_note)
+                                break
+                    
+                finally:
+                    await browser_context.close()
+                    await browser.close()
+            
+            context["state"] = "DONE"
+            await websocket.send_json({"type": "status", "state": "DONE"})
+            await websocket.send_json({"type": "done"})
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Navigation failed: {str(e)}"
+            print(f"[AERIVON UI NAV ERROR] {error_msg}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            
+            await websocket.send_json({
+                "type": "error",
+                "error": error_msg
+            })
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+    
+    async def handle_hybrid_request(request: str):
+        """Handle hybrid requests that combine UI navigation and story generation."""
+        await websocket.send_json({"type": "status", "state": "THINKING"})
+        await websocket.send_json({"type": "thinking", "text": "Planning multi-step solution..."})
+        
+        # For now, acknowledge the hybrid intent
+        await websocket.send_json({
+            "type": "text",
+            "text": "Hybrid mode detected! This would:\n1. Navigate the web to gather information\n2. Transform findings into an illustrated story\n\nFull hybrid orchestration coming soon."
+        })
+        
+        context["state"] = "DONE"
+        await websocket.send_json({"type": "status", "state": "DONE"})
+        await websocket.send_json({"type": "done"})
+    
+    async def handle_conversational(text: str):
+        """Handle general conversational requests."""
+        context["state"] = "THINKING"
+        await websocket.send_json({"type": "status", "state": "THINKING"})
+        
+        try:
+            # Use gemini-2.0-flash for conversational responses
+            response = gen_client.models.generate_content(
+                model="gemini-2.0-flash-001",
+                contents=text,
+                config=types.GenerateContentConfig(
+                    temperature=0.7,
+                    max_output_tokens=1000
+                )
+            )
+            
+            if response.text:
+                await websocket.send_json({
+                    "type": "text",
+                    "text": response.text
+                })
+            
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+            await websocket.send_json({"type": "done"})
+            
+        except Exception as e:
+            await websocket.send_json({"type": "error", "error": f"Conversation failed: {str(e)}"})
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+    
+    async def handle_audio_input(wav_bytes: bytes):
+        """Handle audio input - transcribe and respond."""
+        try:
+            context["state"] = "THINKING"
+            await websocket.send_json({"type": "status", "state": "THINKING"})
+            await websocket.send_json({"type": "thinking", "text": "Listening to your voice..."})
+            
+            # Use Gemini to transcribe the audio (simple transcription, not verbose response)
+            response = gen_client.models.generate_content(
+                model="gemini-2.0-flash-001",
+                contents=[
+                    types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
+                    types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,  # Lower temperature for accurate transcription
+                    max_output_tokens=500
+                )
+            )
+            
+            if response.text:
+                # Extract the transcribed text for intent detection
+                transcribed_text = response.text.strip()
+                
+                # Show what was heard
+                await websocket.send_json({
+                    "type": "text",
+                    "text": f"🎤 {transcribed_text}"
+                })
+                
+                # Route based on the transcribed content
+                await handle_text_message(transcribed_text)
+            else:
+                await websocket.send_json({
+                    "type": "text",
+                    "text": "I couldn't understand the audio. Please try again."
+                })
+                context["state"] = "IDLE"
+                await websocket.send_json({"type": "status", "state": "IDLE"})
+                
+        except Exception as e:
+            await websocket.send_json({"type": "error", "error": f"Audio processing failed: {str(e)}"})
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+    
+    # Main message loop
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+            
+            if msg_type == "interrupt":
+                context["cancel_flag"] = True
+                await websocket.send_json({"type": "interrupted", "source": "client"})
+                context["cancel_flag"] = False
+                context["state"] = "IDLE"
+                await websocket.send_json({"type": "status", "state": "IDLE"})
+                continue
+            
+            if msg_type == "text":
+                text = data.get("text", "").strip()
+                if text:
+                    await handle_text_message(text)
+            
+            elif msg_type == "audio":
+                # Buffer PCM audio chunks
+                b64 = str(data.get("data_b64") or "")
+                if b64:
+                    try:
+                        chunk = base64.b64decode(b64, validate=True)
+                        # Cap at ~2MB to prevent memory issues
+                        if len(audio_pcm) + len(chunk) <= 2 * 1024 * 1024:
+                            audio_pcm.extend(chunk)
+                    except Exception:
+                        pass
+            
+            elif msg_type == "audio_end":
+                # Process the buffered audio
+                if audio_pcm:
+                    context["state"] = "LISTENING"
+                    await websocket.send_json({"type": "status", "state": "LISTENING"})
+                    
+                    # Convert PCM to WAV
+                    wav = _pcm_s16le_to_wav(bytes(audio_pcm), sample_rate=16000, channels=1)
+                    audio_pcm.clear()
+                    
+                    # Use Live API to transcribe and respond to audio
+                    await handle_audio_input(wav)
+            
+            elif msg_type == "start":
+                context["user_id"] = data.get("user_id")
+                context["memory_scope"] = data.get("memory_scope", "aerivon_global")
+                await websocket.send_json({
+                    "type": "status",
+                    "state": "IDLE",
+                    "message": f"Session started for user {context['user_id']}"
+                })
+    
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
         try:
             await websocket.send_json({"type": "error", "error": str(exc)})
         except Exception:

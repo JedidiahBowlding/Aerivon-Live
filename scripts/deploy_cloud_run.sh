@@ -19,7 +19,7 @@ set -euo pipefail
 #   ALLOW_UNAUTHENTICATED   (default: true)
 #   MEMORY                  (default: 512Mi)
 #   CPU                     (default: 1)
-#   TIMEOUT                 (default: 60)
+#   TIMEOUT                 (default: 600)
 #   MAX_INSTANCES           (default: 2)
 #   MIN_INSTANCES           (default: 0)
 #   GOOGLE_CLOUD_LOCATION    (default: us-central1)
@@ -34,7 +34,7 @@ SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 ALLOW_UNAUTHENTICATED="${ALLOW_UNAUTHENTICATED:-true}"
 MEMORY="${MEMORY:-512Mi}"
 CPU="${CPU:-1}"
-TIMEOUT="${TIMEOUT:-60}"
+TIMEOUT="${TIMEOUT:-600}"
 MAX_INSTANCES="${MAX_INSTANCES:-2}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 
