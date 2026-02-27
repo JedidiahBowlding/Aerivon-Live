@@ -703,9 +703,10 @@ function getBackendHttpBase() {
     // ignore
   }
 
-  // Auto-detect: if the frontend itself is hosted on Cloud Run, use same origin.
+  // Auto-detect: if the frontend itself is hosted on Cloud Run, connect to backend.
   if (/\.run\.app$/i.test(location.hostname)) {
-    return `${location.protocol}//${location.host}`;
+    const backendHost = location.hostname.replace(/frontend/i, 'agent');
+    return `${location.protocol}//${backendHost}`;
   }
 
   // Local/dev default.
