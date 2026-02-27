@@ -48,4 +48,4 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY agent.py gemini_client.py server.py tools.py __init__.py ./
 
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT} --ws websockets --log-level info"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT} --log-level info"]
