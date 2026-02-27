@@ -836,6 +836,14 @@
           updateScreenshot(data.data_b64, data.mime_type, data.url);
           break;
 
+        case 'actions':
+          updateActionPlan(data.plan, data.step);
+          break;
+
+        case 'action_result':
+          updateActionResult(data.index, data.result);
+          break;
+
         case 'done':
           // Story complete - remove thinking blocks and finalize
           removeThinkingBlocks();
@@ -987,6 +995,57 @@
         <img src="data:${mimeType};base64,${dataB64}" style="width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.3);" alt="Browser Screenshot" />
         <div style="font-size: 0.7rem; color: rgba(232,223,200,0.5); margin-top: 0.5rem; word-break: break-all;">${escapeHtml(url || '')}</div>
       `;
+    }
+
+    function updateActionPlan(plan, step) {
+      const actionPlanDiv = document.getElementById('actionPlan');
+      if (!actionPlanDiv) return;
+      
+      const actions = plan.actions || [];
+      const note = plan.note || '';
+      const done = plan.done || false;
+      
+      let html = `<div style="font-size: 0.75rem; color: #c9a84c; margin-bottom: 0.5rem; font-weight: 600;">Step ${step}</div>`;
+      
+      if (note) {
+        html += `<div style="font-size: 0.8rem; color: rgba(232,223,200,0.7); margin-bottom: 0.75rem; font-style: italic;">${escapeHtml(note)}</div>`;
+      }
+      
+      if (actions.length > 0) {
+        html += '<div style="display: flex; flex-direction: column; gap: 0.5rem;">';
+        actions.forEach((action, idx) => {
+          const actionType = action.action || 'unknown';
+          const actionText = action.text || action.query || action.url || '';
+          html += `
+            <div id="action-${idx}" style="padding: 0.5rem; background: rgba(255,255,255,0.03); border-radius: 6px; border-left: 3px solid rgba(201,168,76,0.5);">
+              <div style="font-size: 0.75rem; color: #c9a84c; font-weight: 600;">${idx + 1}. ${escapeHtml(actionType.toUpperCase())}</div>
+              ${actionText ? `<div style="font-size: 0.75rem; color: rgba(232,223,200,0.6); margin-top: 0.25rem;">${escapeHtml(actionText)}</div>` : ''}
+              <div id="action-status-${idx}" style="font-size: 0.7rem; color: rgba(232,223,200,0.4); margin-top: 0.25rem;">⏳ Pending...</div>
+            </div>
+          `;
+        });
+        html += '</div>';
+      }
+      
+      if (done) {
+        html += '<div style="font-size: 0.75rem; color: #81c784; margin-top: 0.75rem; font-weight: 600;">✓ Task Complete</div>';
+      }
+      
+      actionPlanDiv.innerHTML = html;
+    }
+
+    function updateActionResult(index, result) {
+      const statusDiv = document.getElementById(`action-status-${index}`);
+      if (!statusDiv) return;
+      
+      const success = result.success !== false;
+      const message = result.message || result.error || '';
+      
+      if (success) {
+        statusDiv.innerHTML = `<span style="color: #81c784;">✓ ${escapeHtml(message || 'Done')}</span>`;
+      } else {
+        statusDiv.innerHTML = `<span style="color: #f44336;">✗ ${escapeHtml(message || 'Failed')}</span>`;
+      }
     }
 
     function appendToTimeline(block) {
