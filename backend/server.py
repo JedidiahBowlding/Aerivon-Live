@@ -610,6 +610,11 @@ async def _ui_screenshot_b64(page) -> tuple[str, bytes]:
     return base64.b64encode(png).decode("ascii"), png
 
 
+@app.get("/ws/ui")
+async def ws_ui_test() -> dict[str, str]:
+    """Test endpoint to verify routing works."""
+    return {"error": "WebSocket upgrade required", "path": "/ws/ui"}
+
 @app.websocket("/ws/ui")
 async def ws_ui(websocket: WebSocket) -> None:
     """UI Navigator WS: Gemini multimodal plans JSON actions, backend executes via Playwright."""
@@ -907,6 +912,11 @@ async def ws_ui(websocket: WebSocket) -> None:
         except Exception:
             pass
 
+
+@app.get("/ws/story")
+async def ws_story_test() -> dict[str, str]:
+    """Test endpoint to verify routing works."""
+    return {"error": "WebSocket upgrade required", "path": "/ws/story"}
 
 @app.websocket("/ws/story")
 async def ws_story(websocket: WebSocket) -> None:
@@ -1434,6 +1444,11 @@ async def architecture() -> dict[str, Any]:
         ],
     }
 
+
+@app.get("/ws/live")
+async def ws_live_test() -> dict[str, str]:
+    """Test endpoint to verify routing works."""
+    return {"error": "WebSocket upgrade required", "path": "/ws/live"}
 
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket) -> None:
