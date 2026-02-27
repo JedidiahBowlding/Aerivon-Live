@@ -505,14 +505,37 @@ async def ws_ui(websocket: WebSocket) -> None:
     memory: list[str] = []
     current_task: str | None = None
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+    # Initialize Playwright with error handling
+    try:
+        playwright_mgr = async_playwright()
+        pw = await playwright_mgr.__aenter__()
+        
+        try:
+            browser = await pw.chromium.launch(headless=True)
+        except Exception as e:
+            import sys
+            import traceback
+            print(f"[WS/UI ERROR] Failed to launch Chromium browser: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            await websocket.send_json({"type": "error", "error": f"Failed to start browser: {str(e)}"})
+            await websocket.close(code=1011)
+            await playwright_mgr.__aexit__(None, None, None)
+            return
+            
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             java_script_enabled=True,
             ignore_https_errors=True,
         )
         page = await context.new_page()
+    except Exception as e:
+        import sys
+        import traceback
+        print(f"[WS/UI ERROR] Playwright initialization failed: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        await websocket.send_json({"type": "error", "error": f"Server initialization failed: {str(e)}"})
+        await websocket.close(code=1011)
+        return
 
         async def send(payload: dict[str, Any]) -> None:
             payload.setdefault("session_id", session_id)
@@ -724,6 +747,10 @@ async def ws_ui(websocket: WebSocket) -> None:
                 pass
             try:
                 await browser.close()
+            except Exception:
+                pass
+            try:
+                await playwright_mgr.__aexit__(None, None, None)
             except Exception:
                 pass
 
