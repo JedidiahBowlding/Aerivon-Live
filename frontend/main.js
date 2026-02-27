@@ -709,7 +709,7 @@ function getBackendHttpBase() {
   }
 
   // Local/dev default.
-  return `${location.protocol}//${location.hostname}:8080`;
+  return `${location.protocol}//${location.hostname}:8081`;
 }
 
 function httpBaseToWsBase(httpBase) {
