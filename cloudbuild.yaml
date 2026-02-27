@@ -1,35 +1,62 @@
-# Cloud Build config to automate Cloud Run deployments.
+# Cloud Build config for automated Cloud Run deployments
 #
-# Create a trigger in Cloud Build pointing at your repo/branch and set substitutions.
+# This deploys both backend and frontend services when changes are pushed to main branch.
 #
-# Substitutions (set in trigger UI or gcloud):
-#   _SERVICE_NAME (default: aerivon-live)
-#   _REGION       (default: us-central1)
-#   _SOURCE_DIR   (default: backend)
+# Required substitutions (set in Cloud Build trigger):
+#   _PROJECT_ID: gemini-live-488120
+#   _SERVICE_ACCOUNT: aerivon-live-run@gemini-live-488120.iam.gserviceaccount.com
+#   _MEMORY_BUCKET: gemini-live-488120-aerivon-memory-1772208730
 #
 substitutions:
-  _SERVICE_NAME: aerivon-live-agent
   _REGION: us-central1
-  _SOURCE_DIR: backend
+  _BACKEND_SERVICE: aerivon-live-agent
+  _FRONTEND_SERVICE: aerivon-live-frontend
 
 steps:
+  # Deploy Backend
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-backend
     entrypoint: bash
     args:
       - -euo
       - pipefail
       - -c
       - |
-        gcloud run deploy "${_SERVICE_NAME}" \
+        gcloud run deploy "${_BACKEND_SERVICE}" \
           --region "${_REGION}" \
-          --source "${_SOURCE_DIR}" \
+          --source backend \
+          --allow-unauthenticated \
+          --service-account "${_SERVICE_ACCOUNT}" \
+          --memory 512Mi \
+          --cpu 1 \
+          --timeout 600 \
+          --max-instances 2 \
+          --min-instances 0 \
+          --session-affinity \
+          --execution-environment gen2 \
+          --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_CLOUD_PROJECT=${_PROJECT_ID},GOOGLE_CLOUD_LOCATION=${_REGION},AERIVON_MEMORY_BUCKET=${_MEMORY_BUCKET},AERIVON_LIVE_MAX_OUTPUT_TOKENS=2500" \
+          --quiet
+
+  # Deploy Frontend
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-frontend
+    entrypoint: bash
+    args:
+      - -euo
+      - pipefail
+      - -c
+      - |
+        gcloud run deploy "${_FRONTEND_SERVICE}" \
+          --region "${_REGION}" \
+          --source frontend \
           --allow-unauthenticated \
           --memory 512Mi \
           --cpu 1 \
-          --timeout 60 \
+          --timeout 600 \
           --max-instances 2 \
-          --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=True" \
+          --min-instances 0 \
           --quiet
 
 options:
   logging: CLOUD_LOGGING_ONLY
+timeout: 1200s
