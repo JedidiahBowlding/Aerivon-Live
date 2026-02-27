@@ -91,7 +91,6 @@ gcloud run deploy "$SERVICE_NAME" \
   --max-instances "$MAX_INSTANCES" \
   --min-instances "$MIN_INSTANCES" \
   --set-env-vars "$ENV_JOINED" \
-  --use-http2 \
   --session-affinity \
   --quiet
 
