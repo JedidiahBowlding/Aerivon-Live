@@ -92,6 +92,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --min-instances "$MIN_INSTANCES" \
   --set-env-vars "$ENV_JOINED" \
   --session-affinity \
+  --execution-environment=gen2 \
   --quiet
 
 echo "Done."
