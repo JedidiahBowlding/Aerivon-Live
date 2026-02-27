@@ -103,6 +103,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Debug middleware to log WebSocket upgrade requests
+@app.middleware("http")
+async def log_ws_requests(request: Request, call_next):
+    if request.url.path.startswith("/ws/"):
+        print(f"DEBUG: Path={request.url.path} Method={request.method} Headers={dict(request.headers)}", flush=True)
+    response = await call_next(request)
+    return response
+
 agent: AerivonLiveAgent | None = None
 SESSION_TOOL_RESULTS: dict[str, list[dict[str, Any]]] = {}
 LAST_REQUEST_TIME: dict[str, float] = {}
