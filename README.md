@@ -2,6 +2,8 @@
 
 Secure autonomous Gemini-powered business agent backend (FastAPI) designed for hackathon demos and Cloud Run deployment.
 
+**Status:** Deployed to Cloud Run with automated CI/CD ✅
+
 ## Architecture Diagram
 
 ![Aerivon Live Architecture](docs/images/aerivon-live-architecture.png)
