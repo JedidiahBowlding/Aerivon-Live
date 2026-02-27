@@ -311,14 +311,14 @@
   const emptyState = document.getElementById('emptyState');
 
   // Web Audio API for PCM16 playback
-  let audioContext = null;
-  let currentAudioSource = null;
+  let storyAudioCtx = null;
+  let storyPlayCursor = 0;
+  let storyActiveSources = [];
 
-  function initAudioContext() {
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-    }
-    return audioContext;
+  function ensureStoryAudioCtx() {
+    if (storyAudioCtx) return;
+    storyAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    storyPlayCursor = storyAudioCtx.currentTime;
   }
 
   // Example chips
@@ -330,8 +330,6 @@
   });
 
   let ws = null;
-  let audioQueue = [];
-  let audioPlaying = false;
   let currentStoryData = null; // Track current story for saving
 
   function getBackendWsBase() {
@@ -355,48 +353,40 @@
     statusBar.className = 'status-bar' + (mode ? ` ${mode}` : '');
   }
 
-  // Audio queue — play PCM16 chunks sequentially using Web Audio API
-  async function playAudioChunk(b64, sampleRate = 24000) {
-    audioQueue.push({ b64, sampleRate });
-    if (!audioPlaying) drainAudioQueue();
+  function playPcmChunk(b64) {
+    ensureStoryAudioCtx();
+    
+    console.log('[STORY AUDIO] playPcmChunk called with', b64.length, 'bytes base64');
+    
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    
+    // PCM16 little-endian → float32
+    const int16 = new Int16Array(bytes.buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+    
+    const buffer = storyAudioCtx.createBuffer(1, float32.length, 24000);
+    buffer.copyToChannel(float32, 0);
+    
+    const src = storyAudioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(storyAudioCtx.destination);
+    
+    const startAt = Math.max(storyPlayCursor, storyAudioCtx.currentTime + 0.05);
+    src.start(startAt);
+    storyPlayCursor = startAt + buffer.duration;
+    storyActiveSources.push(src);
+    src.onended = () => { storyActiveSources = storyActiveSources.filter(s => s !== src); };
+    
+    console.log('[STORY AUDIO] Scheduled', float32.length, 'samples, duration:', buffer.duration.toFixed(2), 's, startAt:', startAt.toFixed(2), 's');
   }
 
-  async function drainAudioQueue() {
-    if (audioQueue.length === 0) { audioPlaying = false; return; }
-    audioPlaying = true;
-    const { b64, sampleRate } = audioQueue.shift();
-    
-    try {
-      const ctx = initAudioContext();
-      
-      // Decode base64 to PCM16 bytes
-      const pcmData = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      
-      // Convert PCM16 (16-bit signed integers) to Float32 for Web Audio
-      const numSamples = pcmData.length / 2;
-      const audioBuffer = ctx.createBuffer(1, numSamples, sampleRate);
-      const channelData = audioBuffer.getChannelData(0);
-      
-      for (let i = 0; i < numSamples; i++) {
-        // Read 16-bit signed integer (little-endian)
-        const int16 = (pcmData[i * 2 + 1] << 8) | pcmData[i * 2];
-        // Convert to signed if necessary
-        const signed = int16 > 32767 ? int16 - 65536 : int16;
-        // Normalize to [-1, 1]
-        channelData[i] = signed / 32768.0;
-      }
-      
-      // Play the audio
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
-      source.onended = () => drainAudioQueue();
-      source.start(0);
-      currentAudioSource = source;
-    } catch (err) {
-      console.error('[AUDIO] Playback error:', err);
-      drainAudioQueue(); // Continue queue on error
-    }
+  function stopStoryAudio() {
+    storyActiveSources.forEach(s => { try { s.stop(); } catch {} });
+    storyActiveSources = [];
+    if (storyAudioCtx) storyPlayCursor = storyAudioCtx.currentTime;
   }
 
   // Append a text scene node
@@ -439,12 +429,7 @@
     storyEl.innerHTML = '';
     storyEl.appendChild(emptyState.cloneNode(true));
     currentTextEl = null;
-    audioQueue = [];
-    audioPlaying = false;
-    if (currentAudioSource) {
-      try { currentAudioSource.stop(); } catch (e) {}
-      currentAudioSource = null;
-    }
+    stopStoryAudio();
     currentStoryData = null;
     saveBtn.disabled = true;
   }
@@ -488,7 +473,8 @@
             currentStoryData.scenes.push({ type: 'image', data: msg.data_b64, mimeType: msg.mime_type || 'image/png' });
           }
         } else if (msg.type === 'audio') {
-          playAudioChunk(msg.data_b64, msg.sample_rate || 24000);
+          console.log('[STORY AUDIO] Received audio chunk:', msg.data_b64.length, 'bytes (base64)');
+          playPcmChunk(msg.data_b64);
         } else if (msg.type === 'status') {
           if (msg.status === 'done') {
             setStatus('Story complete ✨');
@@ -531,12 +517,7 @@
       ws.send(JSON.stringify({ type: 'interrupt' }));
       ws.close(1000, 'user_stop');
     }
-    audioQueue = [];
-    audioPlaying = false;
-    if (currentAudioSource) {
-      try { currentAudioSource.stop(); } catch (e) {}
-      currentAudioSource = null;
-    }
+    stopStoryAudio();
     setStatus('Stopped');
     tellBtn.disabled = false;
     stopBtn.disabled = true;

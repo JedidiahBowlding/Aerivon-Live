@@ -1183,6 +1183,7 @@ async function ensureWs() {
         if (suppressOutputUntilConnected) return;
         updateUIState(AgentState.SPEAKING);
         lastServerOutputAt = performance.now();
+        console.log(`[TEXT DEBUG] Received text message: "${msg.text}"`);
         appendTranscript(msg.text || '');
         return;
       }
@@ -1202,6 +1203,7 @@ async function ensureWs() {
         lastServerOutputAt = performance.now();
         lastServerAudioAt = lastServerOutputAt;
         const u8 = b64ToU8(msg.data_b64 || '');
+        console.log(`[AUDIO DEBUG] Received ${u8.length} bytes of PCM audio data`);
         enqueuePcmForPlayback(u8);
         return;
       }

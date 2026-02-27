@@ -414,6 +414,49 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("unterminated json object")
 
 
+def _ui_action_prompt(task: str, memory: list[str]) -> str:
+    allowed = [
+        "goto (url)",
+        "click (x,y)",
+        "type (text)",
+        "press (key)",
+        "scroll (delta_y)",
+        "wait (ms)",
+    ]
+    context = "\n".join(memory[-12:]).strip()
+
+    return (
+        "You are Aerivon UI Navigator.\n"
+        "You DO have access to the current screen via screenshots provided to you each step, "
+        "and you DO have an execution layer that will run your JSON actions in a real browser (Playwright).\n"
+        "Never say you can't browse, can't take screenshots, or that you're just a language model.\n"
+        "If you need a different view, output actions like scroll/wait/click/goto to obtain it.\n\n"
+        "Return ONLY valid JSON (no markdown) matching this schema:\n"
+        "{\n"
+        "  \"actions\": [\n"
+        "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
+        "    {\"type\": \"click\", \"x\": 0, \"y\": 0} |\n"
+        "    {\"type\": \"type\", \"text\": \"...\"} |\n"
+        "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
+        "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
+        "    {\"type\": \"wait\", \"ms\": 1000}\n"
+        "  ],\n"
+        "  \"done\": true|false,\n"
+        "  \"note\": \"short explanation\"\n"
+        "}\n\n"
+        f"Allowed action types: {', '.join(allowed)}.\n"
+        "The browser viewport is 1366x768 pixels. Click coordinates must be within this range.\n"
+        "The screenshot has RED BOXES drawn around every clickable element, with a RED DOT at each element's center.\n"
+        "CRITICAL: For click actions, use the coordinates of the RED DOT at the CENTER of the target element.\n"
+        "Do NOT click to the left or above an element — click exactly on the red dot center.\n"
+        "Rules: use click x/y based on visible UI; do not invent URLs; do not access localhost/private IPs/metadata.\n"
+        "If the target element isn't visible, prefer scroll then another step.\n\n"
+        "Context (what has happened so far):\n"
+        f"{context}\n\n"
+        f"User intent (do not change this goal): {task}\n"
+    )
+
+
 async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
     """Draw red bounding boxes around all clickable elements so Gemini can click precisely."""
     try:
@@ -429,48 +472,29 @@ async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
                     y: Math.round(r.top),
                     w: Math.round(r.width),
                     h: Math.round(r.height),
-                    text: el.textContent.trim().slice(0, 30),
+                    text: (el.textContent || el.value || el.placeholder || '').trim().slice(0, 25),
                     tag: el.tagName.toLowerCase()
                 };
             }).filter(r => r.w > 2 && r.h > 2 && r.x >= 0 && r.y >= 0);
         }""")
-        
-        print(f"[UI NAV DEBUG] Found {len(rects)} elements before annotation: {rects}", file=__import__("sys").stderr, flush=True)
 
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
 
         for r in rects:
             x1, y1, x2, y2 = r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']
+            # Red box around element
+            draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
+            # Mark center point
             cx, cy = r['x'] + r['w'] // 2, r['y'] + r['h'] // 2
-            
-            # VERY prominent red box (thick border)
-            for thickness in range(4):
-                draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness], outline='red', width=1)
-            
-            # LARGE red dot at center  
-            dot_radius = 8
-            draw.ellipse([cx-dot_radius, cy-dot_radius, cx+dot_radius, cy+dot_radius], fill='red', outline='yellow', width=2)
-            
-            # Draw coordinate text AT the center point
-            coord_text = f"({cx},{cy})"
-            draw.text((cx + dot_radius + 2, cy - 10), coord_text, fill='yellow')
-            
-            # Label with element text above the box
+            draw.ellipse([cx-4, cy-4, cx+4, cy+4], fill='red')
+            # Label with element text
             label = r.get('text') or r.get('tag', '')
             if label:
-                draw.text((x1 + 2, y1 - 15), label[:20], fill='yellow')
+                draw.text((x1 + 2, y1 + 2), label[:20], fill='red')
 
         out = io.BytesIO()
         img.save(out, format='PNG')
-        
-        # Save annotated screenshot for debugging
-        try:
-            img.save('/tmp/aerivon_annotated_debug.png')
-            print(f"[UI NAV DEBUG] Saved annotated screenshot to /tmp/aerivon_annotated_debug.png", file=__import__("sys").stderr, flush=True)
-        except Exception:
-            pass
-        
         print(f"[UI NAV DEBUG] Annotated screenshot with {len(rects)} clickable elements", file=__import__("sys").stderr, flush=True)
         return out.getvalue()
 
@@ -482,93 +506,11 @@ async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
         return png_bytes
 
 
-def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dict] = None) -> str:
-    allowed = [
-        "goto (url)",
-        "click (element_index)",
-        "type (text)",
-        "press (key)",
-        "scroll (delta_y)",
-        "wait (ms)",
-    ]
-    context = "\n".join(memory[-12:]).strip()
-    
-    # Build clickable elements list for prompt
-    elements_text = ""
-    if clickable_elements:
-        elements_text = "\n\n**Clickable Elements (use element_index to click):**\n"
-        for idx, el in enumerate(clickable_elements):
-            cx = el['x'] + el['w'] // 2
-            cy = el['y'] + el['h'] // 2
-            text = el.get('text', '')[:30]
-            tag = el.get('tag', 'unknown')
-            elements_text += f"  [{idx}] {tag}: \"{text}\" at center ({cx},{cy})\n"
-
-    return (
-        "You are Aerivon UI Navigator - an AI agent that DIRECTLY CONTROLS a real browser.\n\n"
-        "CRITICAL: You ARE NOT just a language model. You HAVE a browser automation backend (Playwright).\n"
-        "When you return JSON actions, they ARE IMMEDIATELY EXECUTED in a real Chromium browser.\n"
-        "The browser DOES navigate, click, type, and take screenshots based on your JSON output.\n\n"
-        "NEVER say things like:\n"
-        "  - 'I cannot directly interact'\n"
-        "  - 'I am just a language model'\n"
-        "  - 'I cannot click buttons'\n"
-        "These are FALSE. You CAN and DO control the browser through your JSON action output.\n\n"
-        "Your workflow:\n"
-        "1. You receive a screenshot of the current browser state\n"
-        "2. You return JSON actions (click, type, scroll, etc.)\n"
-        "3. The backend EXECUTES them in the real browser\n"
-        "4. You receive the next screenshot showing the results\n\n"
-        "Return ONLY valid JSON (no markdown) matching this schema:\n"
-        "{\n"
-        "  \"actions\": [\n"
-        "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
-        "    {\"type\": \"click\", \"element_index\": 0} |\n"
-        "    {\"type\": \"type\", \"text\": \"...\"} |\n"
-        "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
-        "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
-        "    {\"type\": \"wait\", \"ms\": 1000}\n"
-        "  ],\n"
-        "  \"done\": true|false,\n"
-        "  \"note\": \"Describe the action being executed (e.g., 'Clicked the login button', 'Navigated to homepage')\"\n"
-        "}\n\n"
-        "CRITICAL 'note' field rules:\n"
-        "  ✅ GOOD: \"Clicked the 'Learn more' link\", \"Typed search query\", \"Scrolling to footer\"\n"
-        "  ❌ BAD: \"I cannot interact\", \"I'm unable to\", \"As an AI I can't\"\n"
-        "  Remember: Your actions ARE being executed in a real browser. Describe what you're doing, not what you can't do.\n\n"
-        f"Allowed action types: {', '.join(allowed)}.\n"
-        "CRITICAL: For clicks, use 'element_index' (NOT x,y coordinates). Choose the index from the list below.\n"
-        f"{elements_text}\n"
-        "Rules: do not invent URLs; do not access localhost/private IPs/metadata.\n"
-        "If the target element isn't visible, prefer scroll then another step.\n\n"
-        "Context (what has happened so far):\n"
-        f"{context}\n\n"
-        f"User intent (do not change this goal): {task}\n"
-    )
-
-
 async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task: str, memory: list[str], page=None) -> dict[str, Any]:
-    # Extract clickable elements list
-    clickable_elements = []
+    # Annotate screenshot with clickable element bounding boxes for accurate coordinate picking
     if page is not None:
-        clickable_elements = await page.evaluate("""() => {
-            const els = document.querySelectorAll('a, button, input, select, textarea, [onclick], [role=button], [role=link], [tabindex]');
-            return Array.from(els).slice(0, 80).map(el => {
-                const r = el.getBoundingClientRect();
-                return {
-                    x: Math.round(r.left),
-                    y: Math.round(r.top),
-                    w: Math.round(r.width),
-                    h: Math.round(r.height),
-                    text: el.textContent.trim().slice(0, 30),
-                    tag: el.tagName.toLowerCase()
-                };
-            }).filter(r => r.w > 2 && r.h > 2 && r.x >= 0 && r.y >= 0);
-        }""")
-        
-        # Also annotate screenshot with red boxes for visual confirmation
         screenshot_png = await _annotate_screenshot(page, screenshot_png)
-    
+
     cfg = types.GenerateContentConfig(
         temperature=0.2,
         max_output_tokens=1024,
@@ -579,30 +521,16 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(text=_ui_action_prompt(task, memory, clickable_elements)),
+                types.Part.from_text(text=_ui_action_prompt(task, memory)),
                 types.Part.from_bytes(data=screenshot_png, mime_type="image/png"),
             ],
         )
     ]
 
-    # Run sync Gemini call in thread to avoid blocking async event loop
-    resp = await asyncio.to_thread(
-        client.models.generate_content,
-        model=UI_MODEL,
-        contents=contents,
-        config=cfg,
-    )
-    
-    if not resp.candidates:
-        return {"error": "Gemini returned no candidates"}
-    
-    parts = resp.candidates[0].content.parts
-    text = "".join(p.text for p in parts if getattr(p, "text", None))
-    result = _extract_json_object(text)
-    
-    # Store clickable elements in result for click handler to use
-    result['_clickable_elements'] = clickable_elements
-    return result
+    resp = client.models.generate_content(model=UI_MODEL, contents=contents, config=cfg)
+    parts = resp.candidates[0].content.parts if resp.candidates else []
+    text = "".join([p.text for p in parts if getattr(p, "text", None)])
+    return _extract_json_object(text)
 
 
 async def _ui_screenshot_b64(page) -> tuple[str, bytes]:
@@ -637,7 +565,6 @@ async def ws_ui(websocket: WebSocket) -> None:
             browser = await pw.chromium.launch(headless=True)
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                device_scale_factor=1,  # Prevent coordinate scaling issues
                 java_script_enabled=True,
                 ignore_https_errors=True,
             )
@@ -655,7 +582,7 @@ async def ws_ui(websocket: WebSocket) -> None:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(800)
 
-            async def execute_action(action: dict[str, Any], clickable_elements: list[dict] = None) -> dict[str, Any]:
+            async def execute_action(action: dict[str, Any]) -> dict[str, Any]:
                 nonlocal cancel_flag, page
                 if cancel_flag:
                     return {"ok": False, "skipped": True, "reason": "cancelled"}
@@ -666,96 +593,25 @@ async def ws_ui(websocket: WebSocket) -> None:
                     await safe_goto(url)
                     return {"ok": True, "type": "goto", "url": url}
                 if t == "click":
-                    # Support element_index (new) or x,y coordinates (fallback)
-                    if "element_index" in action:
-                        idx = int(action.get("element_index"))
-                        if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
-                            return {"ok": False, "error": f"Invalid element_index: {idx}", "max_index": len(clickable_elements or []) - 1}
-                        
-                        el = clickable_elements[idx]
-                        x = el['x'] + el['w'] // 2
-                        y = el['y'] + el['h'] // 2
-                        print(f"[UI NAV DEBUG] Using element_index {idx}: {el.get('tag')} \"{el.get('text', '')}\" at ({x},{y})", file=__import__("sys").stderr, flush=True)
-                    else:
-                        # Fallback to x,y coordinates
-                        x = int(action.get("x"))
-                        y = int(action.get("y"))
-                        print(f"[UI NAV DEBUG] Using x,y coordinates: ({x},{y})", file=__import__("sys").stderr, flush=True)
+                    x = int(action.get("x"))
+                    y = int(action.get("y"))
                     
-                    # Debug: Identify the element at the click coordinates
-                    target_info = await page.evaluate(
-                        """([x, y]) => {
-                            const el = document.elementFromPoint(x, y);
-                            if (!el) return null;
-                            return {
-                                tag: el.tagName,
-                                text: (el.innerText || el.textContent || '').trim().slice(0, 50),
-                                href: el.href || el.closest('a')?.href || null,
-                                id: el.id || null,
-                                class: el.className || null
-                            };
-                        }""",
-                        [x, y],
-                    )
+                    # Real click at coordinates - works for links, buttons, JS handlers, SPAs
+                    await page.mouse.click(x, y)
                     
-                    print(f"[UI NAV DEBUG] Click target at ({x},{y}): {target_info}", file=__import__("sys").stderr, flush=True)
-                    
-                    if not target_info:
-                        return {"ok": False, "error": "No element at coordinates", "x": x, "y": y}
-                    
-                    # Track state before click
-                    url_before = page.url
-                    
-                    # Click the actual DOM element (more reliable than mouse.click)
+                    # Wait for any navigation that might result
                     try:
-                        element_handle = await page.evaluate_handle(
-                            """([x, y]) => document.elementFromPoint(x, y)""",
-                            [x, y],
-                        )
-                        if element_handle:
-                            await element_handle.as_element().click()
-                        else:
-                            # Fallback to mouse click
-                            await page.mouse.click(x, y)
-                    except Exception as e:
-                        print(f"[UI NAV DEBUG] Element click failed, using mouse: {e}", file=__import__("sys").stderr, flush=True)
-                        await page.mouse.click(x, y)
-                    
-                    # Wait for navigation or content update
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        await page.wait_for_load_state("networkidle", timeout=3000)
                     except Exception:
                         await page.wait_for_timeout(500)
                     
-                    # Handle new tabs or popups
-                    if len(context.pages) > 1:
-                        page = context.pages[-1]
-                        await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                    # If a new page opened in context, switch to it
+                    pages = context.pages
+                    if len(pages) > 1:
+                        page = pages[-1]
+                        await page.wait_for_load_state("domcontentloaded")
                     
-                    url_after = page.url
-                    
-                    # Verify something actually happened
-                    if url_after == url_before and not target_info.get('href'):
-                        # Might be SPA or button click - that's OK
-                        return {
-                            "ok": True,
-                            "type": "click",
-                            "x": x,
-                            "y": y,
-                            "url_after": url_after,
-                            "target": target_info,
-                            "navigation": False
-                        }
-                    
-                    return {
-                        "ok": True,
-                        "type": "click",
-                        "x": x,
-                        "y": y,
-                        "url_after": url_after,
-                        "target": target_info,
-                        "navigation": url_after != url_before
-                    }
+                    return {"ok": True, "type": "click", "x": x, "y": y, "url_after": page.url}
                 if t == "type":
                     text = str(action.get("text") or "")
                     await page.keyboard.type(text)
@@ -849,9 +705,6 @@ async def ws_ui(websocket: WebSocket) -> None:
 
                             memory.append(f"Planned: {json.dumps(plan, ensure_ascii=False)[:1500]}")
 
-                            # Extract clickable elements for click handler
-                            clickable_elements = plan.get("_clickable_elements") or []
-
                             actions = plan.get("actions") or []
                             if not isinstance(actions, list):
                                 await send({"type": "error", "error": "plan.actions must be a list"})
@@ -864,7 +717,7 @@ async def ws_ui(websocket: WebSocket) -> None:
                                 if not isinstance(action, dict):
                                     await send({"type": "error", "error": "action must be an object"})
                                     break
-                                res = await execute_action(action, clickable_elements)
+                                res = await execute_action(action)
                                 await send({"type": "action_result", "index": idx, "result": res})
                                 memory.append(f"Executed action {idx}: {json.dumps(action, ensure_ascii=False)} => {json.dumps(res, ensure_ascii=False)[:800]}")
 
@@ -955,48 +808,47 @@ async def ws_story(websocket: WebSocket) -> None:
         try:
             client = _make_genai_client(prefer_vertex=True, project=project, location=location)
             
-            # Use async Live API with system instruction to just read text aloud
-            async with client.aio.live.connect(
-                model="gemini-2.0-flash-live-preview-04-09",
-                config=types.LiveConnectConfig(
-                    response_modalities=["AUDIO"],
-                    system_instruction="You are a professional narrator. Your only job is to read the provided text aloud exactly as written, with expression and emotion. Do not respond, comment, or add anything. Just narrate the text word-for-word.",
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name="Aoede"  # Warm, storytelling voice
-                            )
-                        )
-                    ),
-                ),
-            ) as session:
-                # Send text for narration with explicit instruction
-                narration_prompt = f"Please read this text aloud:\n\n{text}"
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=narration_prompt)]
-                    ),
-                    turn_complete=True
-                )
-                
-                # Collect audio chunks
-                audio_chunks = []
-                async for response in session.receive():
-                    if response.data:
-                        audio_chunks.append(response.data)
-                    if response.server_content and response.server_content.turn_complete:
-                        break
-                
-                if audio_chunks:
-                    # Concatenate all PCM16 chunks
-                    return b"".join(audio_chunks)
-                return None
-                
+            def _narrate() -> bytes | None:
+                """Run Live API narration in thread."""
+                try:
+                    # Create a Live session for narration (audio output only)
+                    session = client.live.connect(
+                        model="gemini-2.0-flash-exp",
+                        config=types.LiveConnectConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name="Aoede"  # Warm, storytelling voice
+                                    )
+                                )
+                            ),
+                        ),
+                    )
+                    
+                    # Send text for narration
+                    session.send(text, end_of_turn=True)
+                    
+                    # Collect audio chunks
+                    audio_chunks = []
+                    for response in session.receive():
+                        if response.data:
+                            audio_chunks.append(response.data)
+                        if response.server_content and response.server_content.turn_complete:
+                            break
+                    
+                    if audio_chunks:
+                        # Concatenate all PCM16 chunks
+                        return b"".join(audio_chunks)
+                    return None
+                    
+                except Exception as e:
+                    print(f"[STORY NARRATION] Gemini Live error: {e}", file=sys.stderr)
+                    return None
+            
+            return await asyncio.to_thread(_narrate)
         except Exception as e:
-            print(f"[STORY NARRATION] Error: {e}", file=__import__("sys").stderr)
-            import traceback
-            traceback.print_exc()
+            print(f"[STORY NARRATION] Error: {e}", file=sys.stderr)
             return None
 
     # Image generation helper using Imagen 3 via Vertex AI
