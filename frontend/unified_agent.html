@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Aerivon Unified Agent - Speak, Navigate, Create</title>
+  <title>Aerivon Command Center | The Unified Multimodal Agent Interface</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -45,6 +45,12 @@
       gap: 0.75rem;
     }
 
+    .branding {
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+
     .logo {
       width: 32px;
       height: 32px;
@@ -58,6 +64,15 @@
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
+      line-height: 1.3;
+    }
+
+    .subtitle {
+      font-size: 0.65rem;
+      color: #c9a84c;
+      font-style: italic;
+      opacity: 0.85;
+      letter-spacing: 0.05em;
     }
 
     .state-badge {
@@ -476,6 +491,10 @@
         font-size: 1.2rem;
       }
 
+      .subtitle {
+        font-size: 0.6rem;
+      }
+
       .state-badge {
         font-size: 0.75rem;
         padding: 0.3rem 0.7rem;
@@ -587,6 +606,10 @@
         font-size: 1rem;
       }
 
+      .subtitle {
+        font-size: 0.55rem;
+      }
+
       .stream-timeline {
         padding: 1rem;
       }
@@ -649,7 +672,10 @@
     <div class="top-bar-left">
       <div class="logo-section">
         <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
-        <h1 class="title">Aerivon Unified</h1>
+        <div class="branding">
+          <h1 class="title">Command Center</h1>
+          <p class="subtitle">The Unified Multimodal Agent Interface</p>
+        </div>
       </div>
       <div class="state-badge idle" id="stateBadge">
         <span id="stateIndicator">●</span>
@@ -695,7 +721,7 @@
     <div class="center-stream">
       <div class="stream-timeline" id="timeline">
         <div class="empty-state">
-          👋 Welcome to Aerivon Unified Agent!<br><br>
+          👋 Welcome to Aerivon Command Center!<br><br>
           I can help you with:<br>
           • 🎤 Voice conversations (click mic to start/stop)<br>
           • 💬 Natural text chat<br>

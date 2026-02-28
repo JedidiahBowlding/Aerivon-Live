@@ -2357,7 +2357,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         "type": "status",
         "state": "IDLE",
         "session_id": session_id,
-        "message": "Aerivon unified agent ready"
+        "message": "Aerivon Command Center ready"
     })
     
     await websocket.send_json({
@@ -2754,7 +2754,7 @@ Make it engaging and visual."""
                             f"Page title: {page_title}"
                         ]
                         
-                        # Run planning loop (limited to 3 steps for unified agent)
+                        # Run planning loop (limited to 3 steps for Command Center)
                         for step in range(3):
                             if context["cancel_flag"]:
                                 await websocket.send_json({"type": "text", "text": "⚠️ Cancelled by user"})

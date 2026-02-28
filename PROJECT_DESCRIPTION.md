@@ -6,8 +6,8 @@ Aerivon Live Agent is a comprehensive demonstration platform showcasing the capa
 
 ## Features and Functionality
 
-### 🌟 Unified Agent (Flagship Feature)
-**Intelligent Multi-Modal Interface with Intent Detection**
+### 🌟 Aerivon Command Center (Flagship Feature)
+**The Unified Multimodal Agent Interface**
 - Single interface that combines voice and text input with automatic intent recognition
 - **Intent Detection**: Automatically identifies user goals (story creation, UI navigation, or conversation)
 - **Voice + Text Input**: Toggle microphone for voice commands or type messages naturally
@@ -286,13 +286,13 @@ print(f"[STORY ERROR] {type(e).__name__}: {e}", file=sys.stderr)
 
 **Lesson**: Match storage solution to access patterns; don't over-engineer
 
-### 11. Unified Agent Architecture
+### 11. Command Center Architecture
 **Challenge**: Users had to choose the right demo interface before starting
 - Eight separate HTML pages for different capabilities
 - Each required understanding which to use
 - No seamless switching between story generation, UI navigation, and conversation
 
-**Solution**: Built Unified Agent with intent detection
+**Solution**: Built Aerivon Command Center with intent detection
 - Single `/ws/aerivon` WebSocket endpoint
 - Backend analyzes user input to detect intent (story, navigate, chat)
 - Frontend displays different UI components based on detected mode
@@ -335,7 +335,7 @@ async def unified_agent_websocket(websocket: WebSocket):
 - Cloud Run deployment simplified (automatic backend URL detection)
 - Seamless user experience across different AI capabilities
 
-**Lesson**: Unified interfaces with intelligent routing provide better UX than forcing users to pre-select capabilities. Backend URL auto-detection is essential for Cloud Run deployments where service URLs are dynamic.
+**Lesson**: Command center interfaces with intelligent routing provide better UX than forcing users to pre-select capabilities. Backend URL auto-detection is essential for Cloud Run deployments where service URLs are dynamic.
 
 ## Future Enhancements
 
@@ -354,6 +354,6 @@ async def unified_agent_websocket(websocket: WebSocket):
 
 Aerivon Live Agent demonstrates the power of Google's Gemini Live API for building rich, multimodal AI applications. The project showcases best practices for real-time streaming, multimodal content generation, cloud storage integration, and user experience design. Through iterative development, I learned the importance of using native model capabilities, proper environment configuration, thoughtful state management, and comprehensive error handling.
 
-The **Unified Agent**, our flagship feature, demonstrates how intelligent intent detection can create a seamless user experience that adapts to different use cases—whether generating illustrated stories, navigating websites, or holding natural conversations. This unified interface reduces cognitive load and showcases the versatility of the Gemini Live API.
+**Aerivon Command Center**, our flagship feature, demonstrates how intelligent intent detection can create a seamless user experience that adapts to different use cases—whether generating illustrated stories, navigating websites, or holding natural conversations. This unified multimodal interface reduces cognitive load and showcases the versatility of the Gemini Live API.
 
 The storybook feature highlights how modern multimodal AI can create engaging, visually rich content in real-time, with the ability to preserve and share those creations through cloud-based storage solutions.

@@ -25,14 +25,14 @@ export GOOGLE_CLOUD_LOCATION="us-central1"
 uvicorn server:app --host 127.0.0.1 --port 8081 --app-dir .
 ```
 
-2. Serve this folder:
+1. Serve this folder:
 
 ```bash
 cd frontend
 python server.py
 ```
 
-3. Open <http://localhost:5174>
+1. Open <http://localhost:5174>
 
 ## Cloud Run Deployment
 
