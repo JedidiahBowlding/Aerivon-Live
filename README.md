@@ -11,7 +11,20 @@ Secure autonomous Gemini-powered business agent backend (FastAPI) designed for h
 ## What this is
 
 Aerivon Live is an autonomous agent runtime that can browse sites (Playwright), scrape leads, and generate outreach messages using Gemini on Vertex AI.
+### 🌟 Unified Agent (NEW)
 
+The **Unified Agent** is our flagship interface that combines voice and text input with intelligent intent detection:
+
+- **Voice + Text Input**: Click the 🎤 mic button to speak or type your message
+- **Intelligent Intent Detection**: Automatically recognizes whether you want to:
+  - Generate creative stories with AI-illustrated images
+  - Navigate and interact with websites using UI automation
+  - Have a natural conversation
+- **Real-time Streaming**: See responses appear instantly as they're generated
+- **Action Plan Visualization**: Watch UI navigation actions execute in real-time
+- **Multimodal Output**: Text, images, and voice narration combined seamlessly
+
+**Try it:** Click the "Unified Agent" link on the home page to experience all features in one interface!
 Key features:
 
 - Vertex AI auth via ADC

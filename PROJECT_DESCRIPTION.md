@@ -2,11 +2,26 @@
 
 ## Overview
 
-Aerivon Live Agent is a comprehensive demonstration platform showcasing the capabilities of Google's Gemini Live API for real-time, multimodal AI interactions. The project features eight distinct demo applications that highlight different use cases for live agent technology, from interactive storytelling to customer support automation.
+Aerivon Live Agent is a comprehensive demonstration platform showcasing the capabilities of Google's Gemini Live API for real-time, multimodal AI interactions. The project features nine distinct demo applications that highlight different use cases for live agent technology, from interactive storytelling to customer support automation.
 
 ## Features and Functionality
 
-### 1. Interactive Storybook (Primary Feature)
+### 🌟 Unified Agent (Flagship Feature)
+**Intelligent Multi-Modal Interface with Intent Detection**
+- Single interface that combines voice and text input with automatic intent recognition
+- **Intent Detection**: Automatically identifies user goals (story creation, UI navigation, or conversation)
+- **Voice + Text Input**: Toggle microphone for voice commands or type messages naturally
+- **Three-in-One Capability**:
+  - **Story Generation**: Creates illustrated stories with AI-generated images using Gemini 2.5 Flash Image Preview
+  - **UI Navigation**: Controls browser automation for web interactions via Playwright
+  - **Natural Conversation**: Engages in contextual dialogue using Gemini Live API
+- **Real-time Action Visualization**: Displays planned actions and execution status in dedicated sidebar
+- **Streaming Content**: Text, images, and narration appear incrementally for responsive UX
+- **Unified WebSocket Backend**: Single `/ws/aerivon` endpoint handles all interaction types
+- **Cloud Run Ready**: Automatically detects backend URL for seamless deployment
+- Elegant dark theme with golden accents matching the Aerivon brand
+
+### 1. Interactive Storybook
 **Multimodal Story Generation with Native Image Creation**
 - Real-time story generation with interleaved text and AI-generated illustrations
 - Uses Gemini 2.5 Flash Image Preview model with native multimodal output
@@ -271,6 +286,57 @@ print(f"[STORY ERROR] {type(e).__name__}: {e}", file=sys.stderr)
 
 **Lesson**: Match storage solution to access patterns; don't over-engineer
 
+### 11. Unified Agent Architecture
+**Challenge**: Users had to choose the right demo interface before starting
+- Eight separate HTML pages for different capabilities
+- Each required understanding which to use
+- No seamless switching between story generation, UI navigation, and conversation
+
+**Solution**: Built Unified Agent with intent detection
+- Single `/ws/aerivon` WebSocket endpoint
+- Backend analyzes user input to detect intent (story, navigate, chat)
+- Frontend displays different UI components based on detected mode
+- Real-time action plan visualization for UI navigation tasks
+
+**Implementation Details**:
+```javascript
+// Frontend: Auto-detect backend URL for Cloud Run
+function getBackendHttpBase() {
+  // Check for server-injected backend
+  if (window.AERIVON_BACKEND_BASE) return window.AERIVON_BACKEND_BASE;
+  // Check query param override
+  if (urlParams.get('backend')) return urlParams.get('backend');
+  // Auto-detect Cloud Run (replace 'frontend' with 'agent')
+  if (/\.run\.app$/i.test(location.hostname)) {
+    return location.hostname.replace(/frontend/i, 'agent');
+  }
+  // Local dev default
+  return `${location.protocol}//${location.hostname}:8081`;
+}
+```
+
+**Backend Pattern**:
+```python
+# Single unified endpoint handles all interaction types
+@app.websocket("/ws/aerivon")
+async def unified_agent_websocket(websocket: WebSocket):
+    # Detect intent from user message
+    if "story" in message.lower() or "tale" in message.lower():
+        await handle_story_generation()
+    elif "navigate" in message.lower() or "open" in message.lower():
+        await handle_ui_navigation()
+    else:
+        await handle_conversation()
+```
+
+**Benefits**:
+- Reduced cognitive load for users (one interface, not eight)
+- Better developer experience (single codebase to maintain for core features)
+- Cloud Run deployment simplified (automatic backend URL detection)
+- Seamless user experience across different AI capabilities
+
+**Lesson**: Unified interfaces with intelligent routing provide better UX than forcing users to pre-select capabilities. Backend URL auto-detection is essential for Cloud Run deployments where service URLs are dynamic.
+
 ## Future Enhancements
 
 1. **Story Gallery UI**: Browse and load saved stories with thumbnails
@@ -288,4 +354,6 @@ print(f"[STORY ERROR] {type(e).__name__}: {e}", file=sys.stderr)
 
 Aerivon Live Agent demonstrates the power of Google's Gemini Live API for building rich, multimodal AI applications. The project showcases best practices for real-time streaming, multimodal content generation, cloud storage integration, and user experience design. Through iterative development, I learned the importance of using native model capabilities, proper environment configuration, thoughtful state management, and comprehensive error handling.
 
-The storybook feature, in particular, highlights how modern multimodal AI can create engaging, visually rich content in real-time, with the ability to preserve and share those creations through cloud-based storage solutions.
+The **Unified Agent**, our flagship feature, demonstrates how intelligent intent detection can create a seamless user experience that adapts to different use cases—whether generating illustrated stories, navigating websites, or holding natural conversations. This unified interface reduces cognitive load and showcases the versatility of the Gemini Live API.
+
+The storybook feature highlights how modern multimodal AI can create engaging, visually rich content in real-time, with the ability to preserve and share those creations through cloud-based storage solutions.
