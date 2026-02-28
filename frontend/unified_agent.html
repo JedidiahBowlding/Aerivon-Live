@@ -441,7 +441,7 @@
     /* Responsive */
     @media (max-width: 1024px) {
       .right-panel {
-        display: none;
+        width: 280px;
       }
 
       .left-drawer {
@@ -497,6 +497,43 @@
         transform: translateX(-100%);
       }
 
+      /* Convert right panel to bottom drawer on mobile */
+      .right-panel {
+        position: fixed;
+        bottom: 0;
+        right: 0;
+        left: 0;
+        width: 100%;
+        max-height: 40vh;
+        border-left: none;
+        border-top: 2px solid rgba(201,168,76,0.3);
+        z-index: 50;
+        transform: translateY(calc(100% - 48px));
+        transition: transform 0.3s ease;
+        box-shadow: 0 -4px 16px rgba(0,0,0,0.3);
+      }
+
+      .right-panel::before {
+        content: '📱 UI Navigator & Actions (Tap to expand)';
+        display: block;
+        padding: 0.75rem 1rem;
+        background: rgba(201,168,76,0.2);
+        color: #c9a84c;
+        font-size: 0.85rem;
+        font-weight: 600;
+        text-align: center;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        cursor: pointer;
+      }
+
+      .right-panel.expanded {
+        transform: translateY(0);
+      }
+
+      .right-panel.expanded::before {
+        content: '📱 UI Navigator & Actions (Tap to collapse)';
+      }
+
       .message-bubble {
         max-width: 95%;
         font-size: 0.9rem;
@@ -506,21 +543,35 @@
       .composer {
         padding: 0.75rem;
         gap: 0.5rem;
+        flex-wrap: wrap;
       }
 
       .composer-input {
         font-size: 0.9rem;
         padding: 0.7rem;
+        min-width: 100%;
       }
 
       .composer-btn {
-        padding: 0.7rem 1rem;
-        font-size: 0.9rem;
+        padding: 0.75rem 1.2rem;
+        font-size: 1rem;
+        flex: 1;
+        min-width: 100px;
+      }
+
+      #micBtn {
+        font-size: 1.3rem;
+        min-width: 120px;
       }
 
       .icon-btn {
         font-size: 0.8rem;
         padding: 0.4rem 0.7rem;
+      }
+
+      /* Adjust center stream to account for bottom panel */
+      .center-stream {
+        margin-bottom: 48px;
       }
     }
 
@@ -542,12 +593,42 @@
         font-size: 0.85rem;
       }
 
+      .composer {
+        padding: 0.5rem;
+      }
+
       .composer-input {
         min-height: 60px;
+        font-size: 0.85rem;
+      }
+
+      .composer-btn {
+        padding: 0.65rem 1rem;
+        font-size: 0.9rem;
+      }
+
+      #micBtn {
+        font-size: 1.2rem;
       }
 
       .empty-state {
         font-size: 0.8rem;
+        padding: 1.5rem 0.75rem;
+      }
+
+      .panel-section {
+        padding: 1rem;
+      }
+
+      .panel-section h3 {
+        font-size: 0.8rem;
+      }
+
+      .right-panel::before {
+        font-size: 0.8rem;
+        padding: 0.6rem 0.75rem;
+      }
+    }
         padding: 1.5rem 0.75rem;
       }
     }
@@ -714,6 +795,17 @@
     const TARGET_SAMPLE_RATE = 16000;
     const toggleDrawer = document.getElementById('toggleDrawer');
     const clearBtn = document.getElementById('clearBtn');
+    const rightPanel = document.querySelector('.right-panel');
+
+    // Make right panel expandable on mobile
+    if (rightPanel) {
+      rightPanel.addEventListener('click', (e) => {
+        // Only toggle if clicking on the panel itself (not inside content)
+        if (e.target === rightPanel || e.target.closest('.panel-section') === null) {
+          rightPanel.classList.toggle('expanded');
+        }
+      });
+    }
 
     // Event Listeners
     sendBtn.addEventListener('click', () => {
