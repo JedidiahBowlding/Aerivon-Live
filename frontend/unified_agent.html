@@ -443,17 +443,112 @@
       .right-panel {
         display: none;
       }
+
+      .left-drawer {
+        width: 260px;
+      }
     }
 
     @media (max-width: 768px) {
+      body {
+        font-size: 0.95rem;
+      }
+
+      .top-bar {
+        padding: 0.5rem 1rem;
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .top-bar-left,
+      .top-bar-right {
+        width: 100%;
+        justify-content: space-between;
+      }
+
+      .top-bar-right {
+        margin-top: 0.5rem;
+        display: flex;
+        gap: 0.5rem;
+      }
+
+      .title {
+        font-size: 1.2rem;
+      }
+
+      .state-badge {
+        font-size: 0.75rem;
+        padding: 0.3rem 0.7rem;
+      }
+
+      .intent-chip {
+        font-size: 0.75rem;
+      }
+
       .left-drawer {
         position: absolute;
         z-index: 100;
         height: 100%;
+        width: 85%;
+        max-width: 300px;
       }
       
       .left-drawer.collapsed {
         transform: translateX(-100%);
+      }
+
+      .message-bubble {
+        max-width: 95%;
+        font-size: 0.9rem;
+        padding: 0.75rem 1rem;
+      }
+
+      .composer {
+        padding: 0.75rem;
+        gap: 0.5rem;
+      }
+
+      .composer-input {
+        font-size: 0.9rem;
+        padding: 0.7rem;
+      }
+
+      .composer-btn {
+        padding: 0.7rem 1rem;
+        font-size: 0.9rem;
+      }
+
+      .icon-btn {
+        font-size: 0.8rem;
+        padding: 0.4rem 0.7rem;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .logo {
+        width: 28px;
+        height: 28px;
+      }
+
+      .title {
+        font-size: 1rem;
+      }
+
+      .stream-timeline {
+        padding: 1rem;
+      }
+
+      .message-bubble {
+        font-size: 0.85rem;
+      }
+
+      .composer-input {
+        min-height: 60px;
+      }
+
+      .empty-state {
+        font-size: 0.8rem;
+        padding: 1.5rem 0.75rem;
       }
     }
   </style>
