@@ -552,19 +552,42 @@
 
   <script>
     // Configuration
-    const urlParams = new URLSearchParams(window.location.search);
-    let backendBase = urlParams.get('backend');
-    
-    // If no backend specified, construct default based on current location
-    if (!backendBase) {
-      const protocol = window.location.protocol;
-      const hostname = window.location.hostname;
-      // Use port 8081 for local dev, or same host for production
-      const port = hostname === 'localhost' || hostname === '127.0.0.1' ? '8081' : window.location.port;
-      backendBase = `${protocol}//${hostname}${port ? ':' + port : ''}`;
+    function getBackendHttpBase() {
+      // If the hosting server injected a backend base (Cloud Run hosted frontend), prefer it.
+      try {
+        const injected = (window && window.AERIVON_BACKEND_BASE) ? String(window.AERIVON_BACKEND_BASE).trim() : '';
+        if (injected) return injected.replace(/\/$/, '');
+      } catch {
+        // ignore
+      }
+
+      // Allow overriding backend base via query param for Cloud Run deployments.
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        const qp = (urlParams.get('backend') || '').trim();
+        if (qp) return qp.replace(/\/$/, '');
+      } catch {
+        // ignore
+      }
+
+      // Auto-detect: if the frontend itself is hosted on Cloud Run, connect to backend.
+      if (/\.run\.app$/i.test(location.hostname)) {
+        const backendHost = location.hostname.replace(/frontend/i, 'agent');
+        return `${location.protocol}//${backendHost}`;
+      }
+
+      // Local/dev default.
+      return `${location.protocol}//${location.hostname}:8081`;
     }
-    
-    const WS_URL = `${backendBase.replace(/^http/, 'ws')}/ws/aerivon`;
+
+    function httpBaseToWsBase(httpBase) {
+      const base = String(httpBase || '').trim();
+      if (!base) return '';
+      return base.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+    }
+
+    const backendBase = getBackendHttpBase();
+    const WS_URL = `${httpBaseToWsBase(backendBase)}/ws/aerivon`;
 
     // State
     let ws = null;
