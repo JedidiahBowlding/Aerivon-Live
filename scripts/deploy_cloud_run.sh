@@ -42,6 +42,9 @@ GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 AERIVON_MEMORY_BUCKET="${AERIVON_MEMORY_BUCKET:-}"
 AERIVON_LIVE_MAX_OUTPUT_TOKENS="${AERIVON_LIVE_MAX_OUTPUT_TOKENS:-2500}"
 
+# Use snark-shot project (has API keys already configured)
+PROJECT_ID="${PROJECT_ID:-snark-shot}"
+
 if ! command -v gcloud >/dev/null 2>&1; then
   echo "ERROR: gcloud not found. Install Google Cloud SDK first." >&2
   exit 1
@@ -52,7 +55,7 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
   exit 1
 fi
 
-PROJECT_ID="${PROJECT_ID:-gemini-live-488120}"
+PROJECT_ID="${PROJECT_ID:-snark-shot}"
 if [[ -z "$PROJECT_ID" ]]; then
   echo "ERROR: PROJECT_ID not set." >&2
   exit 1
