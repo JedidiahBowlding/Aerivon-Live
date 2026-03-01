@@ -2973,6 +2973,13 @@ Make it engaging and visual."""
                         page=page
                     )
                     
+                    # Send action plan to frontend for display
+                    await websocket.send_json({
+                        "type": "actions",
+                        "step": step + 1,
+                        "plan": plan
+                    })
+                    
                     await websocket.send_json({
                         "type": "text",
                         "text": f"📋 Step {step + 1}: {plan.get('note', 'Executing actions...')}"
@@ -2982,46 +2989,75 @@ Make it engaging and visual."""
                     clickable_elements = plan.get("_clickable_elements") or []
                     actions = plan.get("actions") or []
                     
-                    for action in actions:
+                    for idx, action in enumerate(actions):
                         if context["cancel_flag"]:
+                            await websocket.send_json({
+                                "type": "action_result",
+                                "index": idx,
+                                "result": {"success": False, "message": "Cancelled"}
+                            })
                             break
                         
                         action_type = str(action.get("type", "")).lower()
+                        result = {"success": True, "message": "Done"}
                         
-                        # Validate goto URLs before navigation (SSRF protection)
-                        if action_type == "goto":
-                            goto_url = str(action.get("url", ""))
-                            from tools import is_safe_url
-                            if not is_safe_url(goto_url):
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "error": f"🔒 Blocked unsafe URL: {goto_url}"
-                                })
-                                continue
-                            await page.goto(goto_url, wait_until="domcontentloaded", timeout=45000)
-                            await page.wait_for_timeout(1000)
-                        # Execute action (simplified version)
-                        elif action_type == "click":
-                            if "element_index" in action:
-                                idx = int(action.get("element_index", 0))
-                                if 0 <= idx < len(clickable_elements):
-                                    el = clickable_elements[idx]
-                                    x = el['x'] + el['w'] // 2
-                                    y = el['y'] + el['h'] // 2
-                                    await page.mouse.click(x, y)
-                                    await page.wait_for_timeout(800)
-                        elif action_type == "type":
-                            text = str(action.get("text", ""))
-                            await page.keyboard.type(text)
-                            await page.wait_for_timeout(300)
-                        elif action_type == "press":
-                            key = str(action.get("key", "Enter"))
-                            await page.keyboard.press(key)
-                            await page.wait_for_timeout(600)
-                        elif action_type == "scroll":
-                            dy = int(action.get("delta_y", 0))
-                            await page.mouse.wheel(0, dy)
-                            await page.wait_for_timeout(300)
+                        try:
+                            # Validate goto URLs before navigation (SSRF protection)
+                            if action_type == "goto":
+                                goto_url = str(action.get("url", ""))
+                                from tools import is_safe_url
+                                if not is_safe_url(goto_url):
+                                    result = {"success": False, "message": f"Blocked unsafe URL: {goto_url}"}
+                                    await websocket.send_json({
+                                        "type": "action_result",
+                                        "index": idx,
+                                        "result": result
+                                    })
+                                    continue
+                                await page.goto(goto_url, wait_until="domcontentloaded", timeout=45000)
+                                await page.wait_for_timeout(1000)
+                                result["message"] = f"Navigated to {goto_url}"
+                            # Execute action (simplified version)
+                            elif action_type == "click":
+                                if "element_index" in action:
+                                    el_idx = int(action.get("element_index", 0))
+                                    if 0 <= el_idx < len(clickable_elements):
+                                        el = clickable_elements[el_idx]
+                                        x = el['x'] + el['w'] // 2
+                                        y = el['y'] + el['h'] // 2
+                                        await page.mouse.click(x, y)
+                                        await page.wait_for_timeout(800)
+                                        result["message"] = f"Clicked element {el_idx}"
+                                    else:
+                                        result = {"success": False, "message": f"Invalid element index: {el_idx}"}
+                                else:
+                                    result = {"success": False, "message": "No element_index specified"}
+                            elif action_type == "type":
+                                text = str(action.get("text", ""))
+                                await page.keyboard.type(text)
+                                await page.wait_for_timeout(300)
+                                result["message"] = f"Typed: {text[:20]}..."
+                            elif action_type == "press":
+                                key = str(action.get("key", "Enter"))
+                                await page.keyboard.press(key)
+                                await page.wait_for_timeout(600)
+                                result["message"] = f"Pressed {key}"
+                            elif action_type == "scroll":
+                                dy = int(action.get("delta_y", 0))
+                                await page.mouse.wheel(0, dy)
+                                await page.wait_for_timeout(300)
+                                result["message"] = "Scrolled page"
+                            else:
+                                result = {"success": False, "message": f"Unknown action type: {action_type}"}
+                        except Exception as e:
+                            result = {"success": False, "message": f"Error: {str(e)}"}
+                        
+                        # Send action result to frontend
+                        await websocket.send_json({
+                            "type": "action_result",
+                            "index": idx,
+                            "result": result
+                        })
                     
                     # Screenshot after actions
                     b64, png = await _ui_screenshot_b64(page)
