@@ -52,10 +52,9 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
   exit 1
 fi
 
-PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
+PROJECT_ID="${PROJECT_ID:-gemini-live-488120}"
 if [[ -z "$PROJECT_ID" ]]; then
-  echo "ERROR: PROJECT_ID not set and no gcloud default project configured." >&2
-  echo "Set PROJECT_ID or run: gcloud config set project YOUR_PROJECT" >&2
+  echo "ERROR: PROJECT_ID not set." >&2
   exit 1
 fi
 

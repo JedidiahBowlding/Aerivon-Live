@@ -3083,15 +3083,344 @@ Make it engaging and visual."""
         await websocket.send_json({"type": "status", "state": "THINKING"})
         await websocket.send_json({"type": "thinking", "text": "Planning multi-step solution..."})
         
-        # For now, acknowledge the hybrid intent
-        await websocket.send_json({
-            "type": "text",
-            "text": "Hybrid mode detected! This would:\n1. Navigate the web to gather information\n2. Transform findings into an illustrated story\n\nFull hybrid orchestration coming soon."
-        })
-        
-        context["state"] = "DONE"
-        await websocket.send_json({"type": "status", "state": "DONE"})
-        await websocket.send_json({"type": "done"})
+        try:
+            # Use Gemini to extract navigation goals and story theme
+            extraction_prompt = f"""Analyze this user request and extract two components:
+1. Navigation goal: What website to visit and what actions to take
+2. Story theme: What kind of illustrated story to create based on findings
+
+User request: {request}
+
+Respond in JSON format:
+{{
+  "navigation_goal": "specific navigation instructions",
+  "story_theme": "theme for the illustrated story"
+}}"""
+            
+            extraction_client = _make_genai_client(prefer_vertex=True, project=project, location="global")
+            def _extract():
+                return extraction_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=extraction_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.3,
+                        response_mime_type="application/json"
+                    )
+                )
+            response = await asyncio.to_thread(_extract)
+            
+            import json
+            extracted = json.loads(response.text)
+            navigation_goal = extracted.get("navigation_goal", "")
+            story_theme = extracted.get("story_theme", "")
+            
+            await websocket.send_json({
+                "type": "text",
+                "text": f"🎯 Plan:\n1. Navigate: {navigation_goal}\n2. Create story: {story_theme}"
+            })
+            
+            # Phase 1: Execute UI navigation
+            await websocket.send_json({
+                "type": "text",
+                "text": "🌐 Phase 1: Gathering information from the web..."
+            })
+            
+            # Store navigation findings
+            navigation_findings = []
+            
+            # Ensure browser is running
+            if context["browser"] is None:
+                context["browser"] = await _ensure_browser()
+            
+            browser = context["browser"]
+            page = await browser.new_page()
+            
+            try:
+                # Extract URL from navigation goal
+                import re
+                url_match = re.search(r'https?://[^\s]+|\b[\w-]+\.(?:com|org|net|io|gov|edu)\b', navigation_goal)
+                url = url_match.group(0) if url_match else ""
+                if url and not url.startswith("http"):
+                    url = f"https://{url}"
+                
+                if url:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(1000)
+                    
+                    page_title = await page.title()
+                    navigation_findings.append(f"Visited: {page_title}")
+                    
+                    # Take screenshot
+                    b64, png = await _ui_screenshot_b64(page)
+                    await websocket.send_json({
+                        "type": "screenshot",
+                        "mime_type": "image/png",
+                        "data_b64": b64,
+                        "url": page.url
+                    })
+                    
+                    # Execute navigation actions if specified
+                    memory = [f"Navigation goal: {navigation_goal}", f"Current URL: {page.url}"]
+                    
+                    # Run simplified action planning (max 2 steps for hybrid mode)
+                    for step in range(2):
+                        if context["cancel_flag"]:
+                            break
+                        
+                        plan = await _ui_plan_actions(
+                            client=gen_client,
+                            screenshot_png=png,
+                            task=navigation_goal,
+                            memory=memory,
+                            page=page
+                        )
+                        
+                        actions = plan.get("actions") or []
+                        clickable_elements = plan.get("_clickable_elements") or []
+                        
+                        for action in actions:
+                            if context["cancel_flag"]:
+                                break
+                            
+                            action_type = str(action.get("type", "")).lower()
+                            
+                            if action_type == "click":
+                                if "element_index" in action:
+                                    idx = int(action.get("element_index", 0))
+                                    if 0 <= idx < len(clickable_elements):
+                                        el = clickable_elements[idx]
+                                        x = el['x'] + el['w'] // 2
+                                        y = el['y'] + el['h'] // 2
+                                        await page.mouse.click(x, y)
+                                        await page.wait_for_timeout(800)
+                        
+                        # Take screenshot after actions
+                        b64, png = await _ui_screenshot_b64(page)
+                        await websocket.send_json({
+                            "type": "screenshot",
+                            "mime_type": "image/png",
+                            "data_b64": b64,
+                            "url": page.url
+                        })
+                        
+                        note = plan.get("note", "")
+                        if note:
+                            navigation_findings.append(note)
+                        
+                        if plan.get("done"):
+                            break
+                    
+                    # Extract final page content for story context
+                    page_text = await page.evaluate("() => document.body.innerText")
+                    # Take first 500 chars as context
+                    navigation_findings.append(f"Content sample: {page_text[:500]}")
+                
+                await page.close()
+                
+            except Exception as e:
+                await page.close()
+                await websocket.send_json({
+                    "type": "text",
+                    "text": f"⚠️ Navigation completed with some issues: {str(e)}"
+                })
+            
+            # Phase 2: Generate illustrated story
+            await websocket.send_json({
+                "type": "text",
+                "text": "✨ Phase 2: Creating illustrated story from findings..."
+            })
+            
+            context["state"] = "GENERATING"
+            await websocket.send_json({"type": "status", "state": "GENERATING"})
+            
+            # Build story prompt with navigation findings
+            findings_text = "\n".join(navigation_findings)
+            story_prompt = f"""Create an illustrated fantasy story based on these findings:
+
+Theme: {story_theme}
+
+Information gathered:
+{findings_text}
+
+For each scene in the story:
+1. Write 2-3 sentences of vivid narration
+2. Then request an image that visualizes that scene
+
+Keep the story to exactly 2 scenes. Do not label scenes as "Scene 1" or "Scene 2".
+Make it engaging and visual, incorporating elements from the gathered information."""
+            
+            # Use Gemini for story generation
+            story_gen_client = _make_genai_client(
+                prefer_vertex=True, project=project, location="global"
+            )
+            
+            @retry_with_exponential_backoff
+            def _run_story() -> list[dict]:
+                """Run generate_content in thread, return list of parts as dicts."""
+                resp = story_gen_client.models.generate_content(
+                    model="gemini-2.5-flash-image",
+                    contents=story_prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                        temperature=0.9,
+                        max_output_tokens=2000,
+                    ),
+                )
+                
+                # Extract parts from multimodal response
+                parts = []
+                if resp.candidates:
+                    for candidate in resp.candidates:
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if part.text:
+                                    parts.append({"kind": "text", "text": part.text})
+                                elif part.inline_data and part.inline_data.data:
+                                    parts.append({
+                                        "kind": "image",
+                                        "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                        "mime_type": part.inline_data.mime_type,
+                                    })
+                return parts
+            
+            # Run story generation in thread
+            parts = await asyncio.to_thread(_run_story)
+            
+            # Helper to narrate text using Gemini Live API
+            async def narrate_text(text: str) -> bytes | None:
+                """Generate speech audio for story narration."""
+                if context["cancel_flag"]:
+                    return None
+                
+                text = (text or "").strip()
+                if not text or len(text) < 3:
+                    return None
+                
+                try:
+                    narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+                    
+                    async with narrate_client.aio.live.connect(
+                        model="gemini-2.0-flash-exp",
+                        config=types.LiveConnectConfig(
+                            response_modalities=[types.Modality.AUDIO],
+                            system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name="Aoede"
+                                    )
+                                )
+                            ),
+                        ),
+                    ) as session:
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
+                            ),
+                            turn_complete=True
+                        )
+                        
+                        audio_chunks = []
+                        async for response in session.receive():
+                            if context["cancel_flag"]:
+                                raise asyncio.CancelledError()
+                            
+                            if response.data:
+                                audio_chunks.append(response.data)
+                            if response.server_content and response.server_content.turn_complete:
+                                break
+                        
+                        if audio_chunks:
+                            return b"".join(audio_chunks)
+                        return None
+                        
+                except asyncio.CancelledError:
+                    return None
+                except Exception as e:
+                    print(f"[AERIVON NARRATION] Error: {e}", file=sys.stderr)
+                    return None
+            
+            # Stream parts to client with narration
+            pending_text = ""
+            for idx, part in enumerate(parts):
+                if context["cancel_flag"]:
+                    break
+                
+                if part["kind"] == "text":
+                    text = part["text"]
+                    pending_text += text
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": text,
+                        "index": idx
+                    })
+                elif part["kind"] == "image":
+                    # Narrate accumulated text before showing image
+                    if pending_text.strip():
+                        audio_bytes = await narrate_text(pending_text)
+                        if audio_bytes:
+                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                            await websocket.send_json({
+                                "type": "audio",
+                                "data_b64": b64_audio,
+                                "mime_type": "audio/pcm;rate=24000",
+                                "sample_rate": 24000,
+                                "index": idx
+                            })
+                        pending_text = ""
+                    
+                    await websocket.send_json({
+                        "type": "image",
+                        "data_b64": part["data"],
+                        "mime_type": part["mime_type"],
+                        "index": idx
+                    })
+            
+            # Narrate any remaining text
+            if pending_text.strip():
+                audio_bytes = await narrate_text(pending_text)
+                if audio_bytes:
+                    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data_b64": b64_audio,
+                        "mime_type": "audio/pcm;rate=24000",
+                        "sample_rate": 24000,
+                        "index": len(parts)
+                    })
+            
+            # Save hybrid interaction to memory
+            if context["user_id"] and AERIVON_MEMORY_BUCKET:
+                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
+                summary = f"Navigated to gather information, then created illustrated story: {story_theme}"
+                await _append_exchange_to_memory(
+                    user_id=memory_user_id,
+                    user_text=request,
+                    model_text=summary
+                )
+                context["conversation_history"].append({
+                    "t": int(time.time()),
+                    "user": request,
+                    "model": summary
+                })
+            
+            context["state"] = "DONE"
+            await websocket.send_json({"type": "status", "state": "DONE"})
+            await websocket.send_json({"type": "done"})
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Hybrid request failed: {str(e)}"
+            print(f"[AERIVON HYBRID ERROR] {error_msg}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            
+            await websocket.send_json({
+                "type": "error",
+                "error": error_msg
+            })
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
     
     async def handle_conversational(text: str):
         """Handle general conversational requests."""
