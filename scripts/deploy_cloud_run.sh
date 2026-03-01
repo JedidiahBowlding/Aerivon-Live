@@ -78,13 +78,13 @@ if [[ -n "$AERIVON_MEMORY_BUCKET" ]]; then
 fi
 
 # Add API key if available (for Live API narration which doesn't work with Vertex AI)
-if [[ -n "$GEMINI_API_KEY" ]]; then
+if [[ -n "${GEMINI_API_KEY:-}" ]]; then
   ENV_VARS+=("GEMINI_API_KEY=$GEMINI_API_KEY")
   echo "✓ GEMINI_API_KEY will be set in Cloud Run"
-elif [[ -n "$GOOGLE_API_KEY" ]]; then
+elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
   ENV_VARS+=("GOOGLE_API_KEY=$GOOGLE_API_KEY")
   echo "✓ GOOGLE_API_KEY will be set in Cloud Run"
-elif [[ -n "$GOOGLE_CLOUD_API_KEY" ]]; then
+elif [[ -n "${GOOGLE_CLOUD_API_KEY:-}" ]]; then
   ENV_VARS+=("GOOGLE_CLOUD_API_KEY=$GOOGLE_CLOUD_API_KEY")
   echo "✓ GOOGLE_CLOUD_API_KEY will be set in Cloud Run"
 else
