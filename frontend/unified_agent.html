@@ -1721,8 +1721,8 @@
           console.log('▶️ Audio context resumed');
         }
         
-        // Create audio buffer
-        const buffer = storyAudioCtx.createBuffer(1, float32.length, 24000);
+        // Create audio buffer with the correct sample rate
+        const buffer = storyAudioCtx.createBuffer(1, float32.length, sampleRate);
         buffer.copyToChannel(float32, 0);
         
         // Schedule playback with proper timing (key improvement from story.html)

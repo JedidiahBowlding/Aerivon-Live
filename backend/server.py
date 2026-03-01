@@ -2343,6 +2343,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         "conversation_history": [],
         "current_mode": None,
         "active_task": None,
+        "audio_mode": False,  # Track if user is using voice input
         "pw": None,
         "browser": None,
         "browser_context": None,
@@ -2537,6 +2538,9 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
     
     async def handle_text_message(text: str):
         """Handle text-based requests with intent routing."""
+        # User typed text (not voice) - disable audio mode
+        context["audio_mode"] = False
+        
         context["last_user_text"] = text
         context["state"] = "THINKING"
         
@@ -3128,6 +3132,10 @@ Make it engaging and visual."""
                     "type": "text",
                     "text": response.text
                 })
+                
+                # If user spoke to us, speak back
+                if context.get("audio_mode"):
+                    await narrate_and_send(response.text)
             
             # Save exchange to memory
             if context["user_id"] and AERIVON_MEMORY_BUCKET:
@@ -3157,6 +3165,9 @@ Make it engaging and visual."""
     async def handle_audio_input(wav_bytes: bytes):
         """Handle audio input - transcribe and respond."""
         try:
+            # User is using voice input - enable audio mode for response
+            context["audio_mode"] = True
+            
             context["state"] = "THINKING"
             await websocket.send_json({"type": "status", "state": "THINKING"})
             await websocket.send_json({"type": "thinking", "text": "Listening to your voice..."})
