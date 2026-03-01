@@ -76,6 +76,21 @@ ENV_VARS=("GOOGLE_GENAI_USE_VERTEXAI=True" "GOOGLE_CLOUD_PROJECT=$PROJECT_ID" "G
 if [[ -n "$AERIVON_MEMORY_BUCKET" ]]; then
   ENV_VARS+=("AERIVON_MEMORY_BUCKET=$AERIVON_MEMORY_BUCKET")
 fi
+
+# Add API key if available (for Live API narration which doesn't work with Vertex AI)
+if [[ -n "$GEMINI_API_KEY" ]]; then
+  ENV_VARS+=("GEMINI_API_KEY=$GEMINI_API_KEY")
+  echo "✓ GEMINI_API_KEY will be set in Cloud Run"
+elif [[ -n "$GOOGLE_API_KEY" ]]; then
+  ENV_VARS+=("GOOGLE_API_KEY=$GOOGLE_API_KEY")
+  echo "✓ GOOGLE_API_KEY will be set in Cloud Run"
+elif [[ -n "$GOOGLE_CLOUD_API_KEY" ]]; then
+  ENV_VARS+=("GOOGLE_CLOUD_API_KEY=$GOOGLE_CLOUD_API_KEY")
+  echo "✓ GOOGLE_CLOUD_API_KEY will be set in Cloud Run"
+else
+  echo "⚠ No API key found - narration features may not work. Set GEMINI_API_KEY, GOOGLE_API_KEY, or GOOGLE_CLOUD_API_KEY"
+fi
+
 ENV_JOINED=$(IFS=, ; echo "${ENV_VARS[*]}")
 
 gcloud run deploy "$SERVICE_NAME" \

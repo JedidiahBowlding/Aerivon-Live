@@ -3292,8 +3292,10 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                 if not text or len(text) < 3:
                     return None
                 
+                print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
                 try:
-                    narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+                    # Use API key for narration (Live API not available in Vertex AI)
+                    narrate_client = _make_genai_client(prefer_vertex=False, project=project, location=location)
                     
                     async with narrate_client.aio.live.connect(
                         model="gemini-2.0-flash-exp",
