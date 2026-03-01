@@ -2539,8 +2539,10 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
     
     async def handle_text_message(text: str):
         """Handle text-based requests with intent routing."""
-        # User typed text (not voice) - disable audio mode
-        context["audio_mode"] = False
+        # Only disable audio mode if it's not already enabled
+        # (preserves audio_mode=True when called from handle_audio_input)
+        if not context.get("audio_mode"):
+            context["audio_mode"] = False
         
         context["last_user_text"] = text
         context["state"] = "THINKING"
@@ -2660,7 +2662,7 @@ Make it engaging and visual."""
                     narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
                     
                     async with narrate_client.aio.live.connect(
-                        model="gemini-2.0-flash-live-preview-04-09",
+                        model="gemini-3-flash-preview",
                         config=types.LiveConnectConfig(
                             response_modalities=[types.Modality.AUDIO],
                             system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
@@ -3112,11 +3114,11 @@ Make it engaging and visual."""
                         history_text += f"Assistant: {model_msg}\n"
                 system_instruction += history_text
             
-            # Use gemini-2.5-flash for conversational responses with memory
+            # Use Gemini 3 Flash for conversational responses with memory
             # Wrap in asyncio.to_thread to avoid blocking event loop
             def _generate():
                 return gen_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3-flash-preview",
                     contents=text,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction + "\nIf the user asks for help debugging/building, be detailed and actionable.",
@@ -3177,7 +3179,7 @@ Make it engaging and visual."""
             # Wrap in asyncio.to_thread to avoid blocking event loop
             def _transcribe():
                 return gen_client.models.generate_content(
-                    model="gemini-2.0-flash-001",
+                    model="gemini-3-flash-preview",
                     contents=[
                         types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
                         types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
@@ -3579,7 +3581,7 @@ async def post_agent_message_stream(payload: AgentMessageRequest, request: Reque
             os.getenv("AERIVON_SSE_MODEL")
             or os.getenv("GEMINI_FALLBACK_MODEL")
             or os.getenv("AERIVON_WS_FALLBACK_MODEL")
-            or "gemini-2.5-flash"
+            or "gemini-3-flash-preview"
         ).strip()
         model = resolve_fallback_model(project, location, preferred_model) if project else preferred_model
 
