@@ -2364,7 +2364,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
             
             async with narrate_client.aio.live.connect(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash-exp",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
@@ -2662,7 +2662,7 @@ Make it engaging and visual."""
                     narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
                     
                     async with narrate_client.aio.live.connect(
-                        model="gemini-2.5-flash",
+                        model="gemini-2.0-flash-exp",
                         config=types.LiveConnectConfig(
                             response_modalities=[types.Modality.AUDIO],
                             system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
