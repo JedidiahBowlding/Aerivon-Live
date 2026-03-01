@@ -187,7 +187,7 @@ AERIVON_MEMORY_MAX_EXCHANGES = int(os.getenv("AERIVON_MEMORY_MAX_EXCHANGES", "6"
 AERIVON_FIRESTORE_COLLECTION = os.getenv("AERIVON_FIRESTORE_COLLECTION", "").strip()
 
 UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
-UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-2.0-flash").strip()
+UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-3-flash-preview").strip()
 INJECTION_PATTERNS = (
     "ignore previous instructions",
     "reveal system prompt",
@@ -1065,7 +1065,7 @@ async def ws_story(websocket: WebSocket) -> None:
             
             # Use async Live API with system instruction to just read text aloud
             async with client.aio.live.connect(
-                model="gemini-2.0-flash-live-preview-04-09",
+                model="gemini-3-flash-preview",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Your only job is to read the provided text aloud exactly as written, with expression and emotion. Do not respond, comment, or add anything. Just narrate the text word-for-word.",
@@ -1119,6 +1119,7 @@ async def ws_story(websocket: WebSocket) -> None:
                 # Initialize Vertex AI
                 vertexai.init(project=project, location="global")
                 
+                # Fallback to Imagen 3 for legacy image generation
                 model = ImageGenerationModel.from_pretrained("imagegeneration@006")
                 images = model.generate_images(
                     prompt=f"{prompt}, storybook illustration art style, vibrant colors, whimsical",
@@ -1136,7 +1137,7 @@ async def ws_story(websocket: WebSocket) -> None:
             print(f"[STORY IMAGE] Error generating image: {e}", file=sys.stderr)
             return None
 
-    await send({"type": "status", "status": "connected", "model": "gemini-2.5-flash-image-preview"})
+    await send({"type": "status", "status": "connected", "model": "gemini-3-pro-image-preview"})
 
     try:
         while True:
@@ -1183,10 +1184,10 @@ async def ws_story(websocket: WebSocket) -> None:
                 @retry_with_exponential_backoff
                 def _run_story() -> list[dict]:
                     """Run generate_content in thread, return list of parts as dicts."""
-                    print("[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image-preview", file=sys.stderr)
+                    print("[STORY DEBUG] Calling Gemini with model: gemini-3-pro-image-preview", file=sys.stderr)
                     try:
                         resp = gen_client.models.generate_content(
-                            model="gemini-2.5-flash-image-preview",
+                            model="gemini-3-pro-image-preview",
                             contents=story_prompt,
                             config=types.GenerateContentConfig(
                                 response_modalities=["TEXT", "IMAGE"],
@@ -1473,7 +1474,7 @@ async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
             
             # Create Live session for speech synthesis (async only)
             async with client.aio.live.connect(
-                model="gemini-2.0-flash-exp",
+                model="gemini-3-flash-preview",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     speech_config=types.SpeechConfig(
@@ -1609,7 +1610,7 @@ async def ws_live(websocket: WebSocket) -> None:
         user_memory = await _load_user_memory(user_id=memory_user_id)
         memory_prompt = _memory_to_prompt(user_memory)
 
-    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-3-flash-preview").strip()
 
     try:
         client = _make_genai_client(prefer_vertex=vertex_live_enabled, project=project, location=location)
@@ -1737,7 +1738,7 @@ async def ws_live(websocket: WebSocket) -> None:
         # Pick a standard model. If there's no Vertex project, skip model listing.
         preferred = os.getenv(
             "AERIVON_WS_FALLBACK_MODEL",
-            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"),
+            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3-flash-preview"),
         )
         fallback_model = resolve_fallback_model(project, location, preferred) if project else preferred
 
@@ -2363,7 +2364,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
             
             async with narrate_client.aio.live.connect(
-                model="gemini-2.0-flash-live-preview-04-09",
+                model="gemini-3-flash-preview",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
@@ -2613,7 +2614,7 @@ Make it engaging and visual."""
             def _run_story() -> list[dict]:
                 """Run generate_content in thread, return list of parts as dicts."""
                 resp = story_gen_client.models.generate_content(
-                    model="gemini-2.5-flash-image-preview",
+                    model="gemini-3-pro-image-preview",
                     contents=story_prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
