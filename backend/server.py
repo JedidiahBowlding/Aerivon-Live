@@ -187,7 +187,7 @@ AERIVON_MEMORY_MAX_EXCHANGES = int(os.getenv("AERIVON_MEMORY_MAX_EXCHANGES", "6"
 AERIVON_FIRESTORE_COLLECTION = os.getenv("AERIVON_FIRESTORE_COLLECTION", "").strip()
 
 UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
-UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-3-flash-preview").strip()
+UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-2.5-flash").strip()
 INJECTION_PATTERNS = (
     "ignore previous instructions",
     "reveal system prompt",
@@ -1065,7 +1065,7 @@ async def ws_story(websocket: WebSocket) -> None:
             
             # Use async Live API with system instruction to just read text aloud
             async with client.aio.live.connect(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Your only job is to read the provided text aloud exactly as written, with expression and emotion. Do not respond, comment, or add anything. Just narrate the text word-for-word.",
@@ -1137,7 +1137,7 @@ async def ws_story(websocket: WebSocket) -> None:
             print(f"[STORY IMAGE] Error generating image: {e}", file=sys.stderr)
             return None
 
-    await send({"type": "status", "status": "connected", "model": "gemini-3-pro-image-preview"})
+    await send({"type": "status", "status": "connected", "model": "gemini-2.5-flash-image"})
 
     try:
         while True:
@@ -1184,10 +1184,10 @@ async def ws_story(websocket: WebSocket) -> None:
                 @retry_with_exponential_backoff
                 def _run_story() -> list[dict]:
                     """Run generate_content in thread, return list of parts as dicts."""
-                    print("[STORY DEBUG] Calling Gemini with model: gemini-3-pro-image-preview", file=sys.stderr)
+                    print("[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image", file=sys.stderr)
                     try:
                         resp = gen_client.models.generate_content(
-                            model="gemini-3-pro-image-preview",
+                            model="gemini-2.5-flash-image",
                             contents=story_prompt,
                             config=types.GenerateContentConfig(
                                 response_modalities=["TEXT", "IMAGE"],
@@ -1474,7 +1474,7 @@ async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
             
             # Create Live session for speech synthesis (async only)
             async with client.aio.live.connect(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     speech_config=types.SpeechConfig(
@@ -1610,7 +1610,7 @@ async def ws_live(websocket: WebSocket) -> None:
         user_memory = await _load_user_memory(user_id=memory_user_id)
         memory_prompt = _memory_to_prompt(user_memory)
 
-    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-3-flash-preview").strip()
+    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.5-flash").strip()
 
     try:
         client = _make_genai_client(prefer_vertex=vertex_live_enabled, project=project, location=location)
@@ -1738,7 +1738,7 @@ async def ws_live(websocket: WebSocket) -> None:
         # Pick a standard model. If there's no Vertex project, skip model listing.
         preferred = os.getenv(
             "AERIVON_WS_FALLBACK_MODEL",
-            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3-flash-preview"),
+            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"),
         )
         fallback_model = resolve_fallback_model(project, location, preferred) if project else preferred
 
@@ -2364,7 +2364,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
             
             async with narrate_client.aio.live.connect(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
@@ -2607,7 +2607,7 @@ For each scene in the story:
 Keep the story to exactly 2 scenes. Do not label scenes as "Scene 1" or "Scene 2".
 Make it engaging and visual."""
             
-            # Use Vertex AI client for story generation
+            # Use Gemini API client for story generation
             story_gen_client = _make_genai_client(
                 prefer_vertex=True, project=project, location="global"
             )
@@ -2616,7 +2616,7 @@ Make it engaging and visual."""
             def _run_story() -> list[dict]:
                 """Run generate_content in thread, return list of parts as dicts."""
                 resp = story_gen_client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
+                    model="gemini-2.5-flash-image",
                     contents=story_prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
@@ -2662,7 +2662,7 @@ Make it engaging and visual."""
                     narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
                     
                     async with narrate_client.aio.live.connect(
-                        model="gemini-3-flash-preview",
+                        model="gemini-2.5-flash",
                         config=types.LiveConnectConfig(
                             response_modalities=[types.Modality.AUDIO],
                             system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
@@ -3114,11 +3114,11 @@ Make it engaging and visual."""
                         history_text += f"Assistant: {model_msg}\n"
                 system_instruction += history_text
             
-            # Use Gemini 3 Flash for conversational responses with memory
+            # Use Gemini 2.5 Flash for conversational responses with memory
             # Wrap in asyncio.to_thread to avoid blocking event loop
             def _generate():
                 return gen_client.models.generate_content(
-                    model="gemini-3-flash-preview",
+                    model="gemini-2.5-flash",
                     contents=text,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction + "\nIf the user asks for help debugging/building, be detailed and actionable.",
@@ -3179,7 +3179,7 @@ Make it engaging and visual."""
             # Wrap in asyncio.to_thread to avoid blocking event loop
             def _transcribe():
                 return gen_client.models.generate_content(
-                    model="gemini-3-flash-preview",
+                    model="gemini-2.5-flash",
                     contents=[
                         types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
                         types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
@@ -3581,7 +3581,7 @@ async def post_agent_message_stream(payload: AgentMessageRequest, request: Reque
             os.getenv("AERIVON_SSE_MODEL")
             or os.getenv("GEMINI_FALLBACK_MODEL")
             or os.getenv("AERIVON_WS_FALLBACK_MODEL")
-            or "gemini-3-flash-preview"
+            or "gemini-2.5-flash"
         ).strip()
         model = resolve_fallback_model(project, location, preferred_model) if project else preferred_model
 
