@@ -3129,11 +3129,10 @@ Respond in JSON format:
             navigation_findings = []
             
             # Ensure browser is running
-            if context["browser"] is None:
-                context["browser"] = await _ensure_browser()
+            if context["browser"] is None or context["page"] is None:
+                await ensure_browser()
             
-            browser = context["browser"]
-            page = await browser.new_page()
+            page = context["page"]
             
             try:
                 # Extract URL from navigation goal
@@ -3215,10 +3214,7 @@ Respond in JSON format:
                     # Take first 500 chars as context
                     navigation_findings.append(f"Content sample: {page_text[:500]}")
                 
-                await page.close()
-                
             except Exception as e:
-                await page.close()
                 await websocket.send_json({
                     "type": "text",
                     "text": f"⚠️ Navigation completed with some issues: {str(e)}"
