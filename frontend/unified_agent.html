@@ -7,7 +7,7 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    html {
+    html, body {
       height: 100%;
     }
 
@@ -15,10 +15,11 @@
       font-family: 'Georgia', serif;
       background: #0f0c1a;
       color: #e8dfc8;
-      height: 100vh;
+      min-height: 100dvh;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      overflow-x: hidden;
+      padding-bottom: env(safe-area-inset-bottom);
     }
 
     /* Top Bar */
@@ -170,6 +171,7 @@
       display: flex;
       flex: 1;
       overflow: hidden;
+      min-height: 0;
     }
 
     /* Left Drawer */
@@ -226,6 +228,7 @@
       flex: 1;
       display: flex;
       flex-direction: column;
+      min-height: 0;
       overflow: hidden;
     }
 
@@ -304,8 +307,8 @@
 
     .image-block {
       margin: 1rem 0;
-      max-width: 600px;
       width: 100%;
+      max-width: 100%;
       flex-shrink: 0;
     }
 
@@ -328,12 +331,16 @@
 
     /* Composer */
     .composer {
+      position: sticky;
+      bottom: 0;
       border-top: 1px solid rgba(255,255,255,0.08);
       padding: 1.25rem;
-      background: rgba(255,255,255,0.03);
+      background: #0f0c1a;
       display: flex;
       gap: 0.75rem;
       align-items: flex-end;
+      z-index: 50;
+      padding-bottom: calc(1.25rem + env(safe-area-inset-bottom));
     }
 
     .composer-input {
@@ -343,7 +350,7 @@
       border-radius: 8px;
       color: #e8dfc8;
       font-family: Georgia, serif;
-      font-size: 0.95rem;
+      font-size: 16px;
       padding: 0.75rem 1rem;
       resize: none;
       min-height: 50px;
@@ -389,14 +396,27 @@
     }
 
     #micBtn.recording {
-      background: linear-gradient(135deg, #ff4444, #cc0000);
+      background: linear-gradient(135deg, #4caf50, #66bb6a);
       animation: pulse-mic 1s infinite;
       color: white;
+      box-shadow: 0 0 15px rgba(76, 175, 80, 0.4);
+    }
+
+    #micBtn.live-mode {
+      background: linear-gradient(135deg, #f44336, #e53935);
+      animation: pulse-live 1.2s ease-in-out infinite;
+      color: white;
+      box-shadow: 0 0 25px rgba(244, 67, 54, 0.6);
     }
 
     @keyframes pulse-mic {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.7; }
+    }
+
+    @keyframes pulse-live {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.05); opacity: 0.85; }
     }
 
     /* Right Panel */
@@ -504,32 +524,44 @@
         font-size: 0.75rem;
       }
 
+      .main-container {
+        flex-direction: column;
+      }
+
       .left-drawer {
-        position: absolute;
-        z-index: 100;
+        position: fixed;
+        top: 0;
+        left: 0;
         height: 100%;
         width: 85%;
-        max-width: 300px;
+        max-width: 320px;
+        z-index: 200;
+        transform: translateX(-100%);
       }
       
       .left-drawer.collapsed {
         transform: translateX(-100%);
       }
 
+      .left-drawer:not(.collapsed) {
+        transform: translateX(0);
+      }
+
       /* Convert right panel to bottom drawer on mobile */
       .right-panel {
         position: fixed;
         bottom: 0;
-        right: 0;
         left: 0;
         width: 100%;
-        max-height: 40vh;
+        height: 45vh;
+        max-height: 60vh;
+        background: #0f0c1a;
         border-left: none;
         border-top: 2px solid rgba(201,168,76,0.3);
-        z-index: 50;
-        transform: translateY(calc(100% - 48px));
+        transform: translateY(85%);
         transition: transform 0.3s ease;
-        box-shadow: 0 -4px 16px rgba(0,0,0,0.3);
+        z-index: 150;
+        overflow-y: auto;
       }
 
       .right-panel::before {
@@ -562,37 +594,29 @@
       .composer {
         padding: 0.75rem;
         gap: 0.5rem;
-        flex-wrap: wrap;
+        flex-direction: column;
       }
 
       .composer-input {
-        font-size: 0.9rem;
+        font-size: 16px;
         padding: 0.7rem;
         width: 100%;
-        flex-basis: 100%;
-        margin-bottom: 0.5rem;
       }
 
       .composer-btn {
         padding: 0.75rem 1.2rem;
         font-size: 1rem;
-        flex: 1;
-        min-width: 120px;
+        width: 100%;
       }
 
       #micBtn {
         font-size: 1.3rem;
-        min-width: 140px;
+        width: 100%;
       }
 
       .icon-btn {
         font-size: 0.8rem;
         padding: 0.4rem 0.7rem;
-      }
-
-      /* Adjust center stream to account for bottom panel */
-      .center-stream {
-        margin-bottom: 48px;
       }
     }
 
@@ -625,22 +649,19 @@
 
       .composer-input {
         min-height: 60px;
-        font-size: 0.85rem;
+        font-size: 16px;
         width: 100%;
-        flex-basis: 100%;
-        margin-bottom: 0.5rem;
       }
 
       .composer-btn {
         padding: 0.65rem 1rem;
         font-size: 0.9rem;
-        flex: 1;
-        min-width: 110px;
+        width: 100%;
       }
 
       #micBtn {
         font-size: 1.2rem;
-        min-width: 130px;
+        width: 100%;
       }
 
       .empty-state {
@@ -661,8 +682,105 @@
         padding: 0.6rem 0.75rem;
       }
     }
-        padding: 1.5rem 0.75rem;
-      }
+
+    /* ================================
+       WOW ADD-ONS (Wave + Elevation + Intent + Core Pulse)
+    ================================ */
+
+    /* --- Waveform --- */
+    .wave-wrap{
+      width: min(460px, 100%);
+      height: 42px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(124,77,255,0.25);
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+
+    #waveCanvas{
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* On mobile, make it full width and sit nicely */
+    @media (max-width: 768px){
+      .wave-wrap{ width: 100%; }
+    }
+
+    /* --- Elevation transitions by state (smooth "Material" lift) --- */
+    :root{
+      --elev-0: 0 0 0 rgba(0,0,0,0);
+      --elev-1: 0 8px 24px rgba(0,0,0,0.35);
+      --elev-2: 0 14px 40px rgba(0,0,0,0.55);
+      --elev-3: 0 18px 54px rgba(0,0,0,0.65);
+    }
+
+    /* Apply elevation to surfaces */
+    .top-bar,
+    .composer,
+    .left-drawer,
+    .right-panel{
+      transition: box-shadow 280ms cubic-bezier(0.4,0,0.2,1),
+                  transform 280ms cubic-bezier(0.4,0,0.2,1);
+      box-shadow: var(--elev-1);
+    }
+
+    /* State-based lift */
+    body[data-state="IDLE"] .top-bar,
+    body[data-state="IDLE"] .composer { box-shadow: var(--elev-1); }
+
+    body[data-state="LISTENING"] .top-bar,
+    body[data-state="LISTENING"] .composer { box-shadow: var(--elev-2); transform: translateY(-1px); }
+
+    body[data-state="THINKING"] .top-bar,
+    body[data-state="THINKING"] .composer { box-shadow: var(--elev-2); }
+
+    body[data-state="SPEAKING"] .top-bar,
+    body[data-state="SPEAKING"] .composer { box-shadow: var(--elev-3); transform: translateY(-2px); }
+
+    /* --- Intent chip slide-in --- */
+    .intent-chip{
+      opacity: 0;
+      transform: translateY(-8px) scale(0.98);
+      transition: opacity 240ms cubic-bezier(0.4,0,0.2,1),
+                  transform 240ms cubic-bezier(0.4,0,0.2,1);
+      will-change: transform, opacity;
+    }
+
+    .intent-chip.show{
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+
+    /* --- AI core pulse background on speaking --- */
+    body::after{
+      content:"";
+      position: fixed;
+      inset: -40vmax;
+      pointer-events: none;
+      opacity: 0;
+      background:
+        radial-gradient(circle at 35% 20%,
+          rgba(0,229,255,0.20),
+          rgba(124,77,255,0.10) 25%,
+          transparent 60%);
+      filter: blur(30px);
+      transition: opacity 280ms cubic-bezier(0.4,0,0.2,1);
+    }
+
+    body.core-pulse::after{
+      opacity: 1;
+      animation: corePulse 2.1s ease-in-out infinite;
+    }
+
+    @keyframes corePulse{
+      0%,100% { transform: scale(1); opacity: 0.85; }
+      50%     { transform: scale(1.06); opacity: 1; }
     }
   </style>
 </head>
@@ -723,7 +841,7 @@
         <div class="empty-state">
           👋 Welcome to Aerivon Command Center!<br><br>
           I can help you with:<br>
-          • 🎤 Voice conversations (click mic to start/stop)<br>
+          • 🎤 Voice conversations (click mic for automatic turn-taking)<br>
           • 💬 Natural text chat<br>
           • 🌐 Web navigation & automation<br>
           • 📖 Illustrated story generation<br><br>
@@ -736,10 +854,16 @@
         <textarea 
           class="composer-input" 
           id="messageInput" 
-          placeholder="Type your message or CLICK the 🎤 mic button to speak... Try saying: 'Create a fantasy story about a dragon' or 'Open Nike.com'"
+          placeholder="Type your message or CLICK 🎤 for LIVE conversation (automatic turn-taking)..."
           rows="2"
         ></textarea>
-        <button class="composer-btn" id="micBtn" title="Click to toggle microphone">🎤</button>
+
+        <!-- Waveform visualizer -->
+        <div class="wave-wrap" aria-hidden="true">
+          <canvas id="waveCanvas" width="420" height="42"></canvas>
+        </div>
+
+        <button class="composer-btn" id="micBtn" title="Click to start live conversation">🎤</button>
         <button class="composer-btn" id="sendBtn">Send</button>
       </div>
     </div>
@@ -827,16 +951,36 @@
     let processor = null;
     let sourceNode = null;
     let isRecording = false;
+    let isLiveMode = false; // Live conversation mode (stays on)
     const TARGET_SAMPLE_RATE = 16000;
     const toggleDrawer = document.getElementById('toggleDrawer');
     const clearBtn = document.getElementById('clearBtn');
     const rightPanel = document.querySelector('.right-panel');
 
+    // Voice Activity Detection (VAD) state
+    let vadSilenceThreshold = 0.01; // Energy threshold for silence
+    let vadSilenceDuration = 800; // ms of silence before sending audio_end
+    let vadSpeakingDuration = 300; // ms of speaking before interrupting agent
+    let lastSpeechTime = 0;
+    let silenceTimer = null;
+    let isSpeaking = false;
+    let isAgentSpeaking = false;
+
+    // ---- Waveform (RMS) visualizer state ----
+    const waveCanvas = document.getElementById('waveCanvas');
+    const waveCtx = waveCanvas ? waveCanvas.getContext('2d') : null;
+    let waveHistory = new Array(80).fill(0); // rolling RMS values
+    let waveAnimId = null;
+    let lastRms = 0;
+
+    // ---- State tracking for transitions / sounds ----
+    let lastUiState = 'IDLE';
+
     // Make right panel expandable on mobile
     if (rightPanel) {
       rightPanel.addEventListener('click', (e) => {
-        // Only toggle if clicking on the panel itself (not inside content)
-        if (e.target === rightPanel || e.target.closest('.panel-section') === null) {
+        // Allow tap anywhere on mobile
+        if (window.innerWidth <= 768) {
           rightPanel.classList.toggle('expanded');
         }
       });
@@ -856,13 +1000,31 @@
       }
     });
     
-    // Microphone toggle function
+    // Microphone toggle function - switches to live mode
     function toggleRecording() {
       unlockAudio();
-      if (isRecording) {
-        stopRecording();
+      if (isLiveMode) {
+        // End live mode
+        isLiveMode = false;
+        if (isRecording) {
+          stopRecording();
+          // Send audio_end when exiting live mode
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'audio_end' }));
+          }
+        }
+        micBtn.classList.remove('live-mode');
+        micBtn.title = 'Click to start live conversation';
+        addDebugLog('🔴 Live mode ended');
+        updateState('IDLE');
       } else {
+        // Start live mode
+        isLiveMode = true;
         startRecording();
+        micBtn.classList.add('live-mode');
+        micBtn.title = 'Click to end live conversation (auto VAD active)';
+        addDebugLog('🟢 Live mode started - automatic turn-taking enabled!');
+        updateState('LISTENING');
       }
     }
     
@@ -914,6 +1076,67 @@
       return btoa(binary);
     }
 
+    // Voice Activity Detection - calculate RMS energy
+    function calculateRMS(audioData) {
+      let sum = 0;
+      for (let i = 0; i < audioData.length; i++) {
+        sum += audioData[i] * audioData[i];
+      }
+      return Math.sqrt(sum / audioData.length);
+    }
+
+    // Handle voice activity detection
+    function handleVAD(rms) {
+      if (!isLiveMode) return;
+
+      const now = Date.now();
+      const wasSpeaking = isSpeaking;
+      isSpeaking = rms > vadSilenceThreshold;
+
+      if (isSpeaking) {
+        lastSpeechTime = now;
+        
+        // Clear any pending silence timer
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+          silenceTimer = null;
+        }
+
+        // If user starts speaking while agent is talking, interrupt the agent
+        if (isAgentSpeaking && !wasSpeaking) {
+          stopStoryAudio();
+          isAgentSpeaking = false;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'interrupt' }));
+          }
+          addDebugLog('🔴 Interrupted agent - you started speaking');
+          updateState('LISTENING');
+        }
+
+        if (!wasSpeaking) {
+          addDebugLog('🎙️ Speaking detected');
+          updateState('LISTENING');
+        }
+      } else {
+        // User is silent
+        if (wasSpeaking) {
+          // User just stopped speaking - start silence timer
+          addDebugLog('🤫 Silence detected, waiting...');
+          
+          if (silenceTimer) clearTimeout(silenceTimer);
+          
+          silenceTimer = setTimeout(() => {
+            if (isLiveMode && ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'audio_end' }));
+              addDebugLog('✅ Silence confirmed - agent\'s turn');
+              updateState('THINKING');
+            }
+            silenceTimer = null;
+          }, vadSilenceDuration);
+        }
+      }
+    }
+
     // Start recording audio
     async function startRecording() {
       if (isRecording || !isConnected) return;
@@ -921,7 +1144,7 @@
       try {
         isRecording = true;
         micBtn.classList.add('recording');
-        addDebugLog('🎤 Recording started');
+        addDebugLog('🎤 Microphone active');
 
         // Get microphone access
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -941,6 +1164,16 @@
           if (!ws || ws.readyState !== WebSocket.OPEN || !isRecording) return;
 
           const input = e.inputBuffer.getChannelData(0);
+          
+          // Voice Activity Detection
+          if (isLiveMode) {
+            const rms = calculateRMS(input);
+            handleVAD(rms);
+            
+            // ---- WOW: Push RMS to waveform visualizer ----
+            pushRms(rms);
+          }
+          
           const downsampled = downsampleBuffer(input, audioCtx.sampleRate, TARGET_SAMPLE_RATE);
           const int16 = floatTo16BitPCM(downsampled);
           const u8 = new Uint8Array(int16.buffer);
@@ -969,10 +1202,19 @@
 
       isRecording = false;
       micBtn.classList.remove('recording');
-      addDebugLog('🎤 Recording stopped');
+      addDebugLog('🎤 Microphone stopped');
 
-      // Send audio_end signal
-      if (ws && ws.readyState === WebSocket.OPEN) {
+      // Clear VAD timers
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+      isSpeaking = false;
+      isAgentSpeaking = false;
+
+      // Only send audio_end if NOT in live mode
+      // In live mode, we keep the session open for continuous interaction
+      if (!isLiveMode && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'audio_end' }));
       }
 
@@ -1074,6 +1316,8 @@
             base64Length: data.data_b64?.length || 0,
             mimeType: data.mime_type
           });
+          isAgentSpeaking = true;
+          updateState('SPEAKING');
           playAudio(data.data_b64, data.sample_rate || 24000);
           break;
 
@@ -1093,11 +1337,13 @@
           // Story complete - remove thinking blocks and finalize
           removeThinkingBlocks();
           finalizeAssistantMessage();
+          isAgentSpeaking = false;
           updateState('IDLE');
           break;
 
         case 'error':
           addErrorMessage(data.error);
+          isAgentSpeaking = false;
           updateState('IDLE');
           break;
 
@@ -1135,10 +1381,115 @@
       messageInput.style.height = 'auto';
     }
 
+    // ============ WOW: Waveform visualizer functions ============
+    function resizeWaveCanvasToCss() {
+      if (!waveCanvas) return;
+      const dpr = window.devicePixelRatio || 1;
+      const rect = waveCanvas.getBoundingClientRect();
+      waveCanvas.width = rect.width * dpr;
+      waveCanvas.height = rect.height * dpr;
+      waveCtx.scale(dpr, dpr);
+    }
+
+    function pushRms(rms) {
+      // Normalize typical RMS range 0..0.2 → 0..1
+      let normalized = (rms / 0.2) * 1.2;
+      normalized = Math.min(normalized, 1);
+      
+      // Power curve for punchier visual
+      normalized = Math.pow(normalized, 0.75);
+      
+      // Smooth
+      lastRms = lastRms * 0.92 + normalized * 0.08;
+      
+      // Shift array left, add new value
+      waveHistory.shift();
+      waveHistory.push(lastRms);
+      
+      // Draw
+      drawWaveform();
+    }
+
+    function drawWaveform() {
+      if (!waveCanvas || !waveCtx) return;
+      const w = waveCanvas.width / (window.devicePixelRatio || 1);
+      const h = waveCanvas.height / (window.devicePixelRatio || 1);
+      
+      waveCtx.clearRect(0, 0, w, h);
+      
+      const barCount = waveHistory.length;
+      const barWidth = (w / barCount) * 0.8;
+      const gap = (w / barCount) * 0.2;
+      const midY = h / 2;
+      
+      waveCtx.fillStyle = 'rgba(0,229,255,0.85)';
+      
+      for (let i = 0; i < barCount; i++) {
+        const x = i * (barWidth + gap);
+        const val = waveHistory[i];
+        const barHeight = val * midY * 0.9;
+        
+        // Primary trace
+        waveCtx.fillRect(x, midY - barHeight, barWidth, barHeight);
+        // Mirror trace
+        waveCtx.fillRect(x, midY, barWidth, barHeight * 0.6);
+      }
+      
+      // Request next frame if actively recording
+      if (isRecording) {
+        waveAnimId = requestAnimationFrame(drawWaveform);
+      }
+    }
+
+    // Listen for window resize
+    window.addEventListener('resize', () => {
+      resizeWaveCanvasToCss();
+      drawWaveform();
+    });
+
+    // ============ WOW: Listening chime (on state transition) ============
+    function playListeningChime() {
+      if (!audioCtx || audioCtx.state === 'suspended') return;
+      
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1320, audioCtx.currentTime + 0.08);
+      
+      gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+      
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.12);
+    }
+
     // UI Update Functions
     function updateState(state) {
       stateText.textContent = state;
       stateBadge.className = `state-badge ${state.toLowerCase()}`;
+      
+      // ---- WOW: Add data-state attribute for elevation transitions ----
+      document.body.setAttribute('data-state', state);
+      
+      // ---- WOW: Toggle core-pulse class when SPEAKING ----
+      if (state === 'SPEAKING') {
+        document.body.classList.add('core-pulse');
+      } else {
+        document.body.classList.remove('core-pulse');
+      }
+      
+      // ---- WOW: Play listening chime on state change ----
+      if (state !== lastUiState) {
+        if (state === 'LISTENING' || state === 'THINKING') {
+          playListeningChime();
+        }
+        lastUiState = state;
+      }
     }
 
     function updateIntent(data) {
@@ -1147,6 +1498,11 @@
       intentConfidence.textContent = data.confidence.toFixed(2);
       intentReason.textContent = data.reason || 'No reason provided';
       confidenceFill.style.width = (data.confidence * 100) + '%';
+      
+      // ---- WOW: Slide-in animation for intent chip ----
+      requestAnimationFrame(() => {
+        intentChip.classList.add('show');
+      });
     }
 
     function updateSessionInfo(info) {
@@ -1381,6 +1737,14 @@
         
         src.onended = () => {
           storyActiveSources = storyActiveSources.filter(s => s !== src);
+          // If all audio chunks have finished playing, agent is done speaking
+          if (storyActiveSources.length === 0) {
+            isAgentSpeaking = false;
+            if (isLiveMode) {
+              addDebugLog('🎧 Agent finished speaking - your turn');
+              updateState('LISTENING');
+            }
+          }
         };
         
         console.log('▶️ Scheduled audio chunk, duration:', buffer.duration.toFixed(2), 's, startAt:', startAt.toFixed(2), 's');
@@ -1414,6 +1778,12 @@
     }
 
     // Initialize
+    // ---- WOW: Initialize waveform canvas ----
+    if (waveCanvas) {
+      resizeWaveCanvasToCss();
+      drawWaveform();
+    }
+    
     connect();
   </script>
 </body>

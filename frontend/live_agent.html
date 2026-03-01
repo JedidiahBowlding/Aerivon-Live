@@ -10,7 +10,7 @@
     <link rel="manifest" href="./assets/site.webmanifest" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: 'Georgia', serif; background: #0f0c1a; color: #e8dfc8; min-height: 100vh; padding: 2rem 1.5rem; }
+      body { font-family: 'Georgia', serif; background: #0f0c1a; color: #e8dfc8; min-height: 100dvh; overflow-x: hidden; padding: 2rem 1.5rem; padding-bottom: calc(2rem + env(safe-area-inset-bottom)); }
       .header { display: flex; align-items: center; gap: 12px; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.08); }
       .logo { width: 40px; height: 40px; border-radius: 10px; box-shadow: 0 4px 16px rgba(201,168,76,0.2); }
       h1 { font-size: 1.8rem; letter-spacing: 0.08em; background: linear-gradient(135deg, #c9a84c, #e8dfc8, #c9a84c); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin: 0; }

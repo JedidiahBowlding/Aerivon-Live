@@ -15,8 +15,10 @@
         font-family: 'Georgia', serif;
         background: #0f0c1a;
         color: #e8dfc8;
-        min-height: 100vh;
+        min-height: 100dvh;
+        overflow-x: hidden;
         padding: 2rem 1.5rem;
+        padding-bottom: calc(2rem + env(safe-area-inset-bottom));
       }
 
       .header {

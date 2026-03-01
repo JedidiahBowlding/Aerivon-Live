@@ -10,13 +10,13 @@
     <link rel="manifest" href="./assets/site.webmanifest" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: 'Georgia', serif; background: #0f0c1a; color: #e8dfc8; min-height: 100vh; padding: 2rem 1.5rem; }
+      body { font-family: 'Georgia', serif; background: #0f0c1a; color: #e8dfc8; min-height: 100dvh; overflow-x: hidden; padding: 2rem 1.5rem; padding-bottom: calc(2rem + env(safe-area-inset-bottom)); }
       .header { display: flex; align-items: center; gap: 12px; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.08); }
       .logo { width: 40px; height: 40px; border-radius: 10px; box-shadow: 0 4px 16px rgba(201,168,76,0.2); }
       h1 { font-size: 1.8rem; letter-spacing: 0.08em; background: linear-gradient(135deg, #c9a84c, #e8dfc8, #c9a84c); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin: 0; }
       h3 { color: #c9a84c; margin: 1.5rem 0 0.75rem; letter-spacing: 0.05em; font-size: 1.2rem; }
       .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
-      input { padding: 0.65rem 0.9rem; background: rgba(255,255,255,0.06); border: 1px solid rgba(201,168,76,0.3); border-radius: 8px; color: #e8dfc8; font-family: Georgia, serif; outline: none; transition: border-color 0.2s; }
+      input { padding: 0.65rem 0.9rem; background: rgba(255,255,255,0.06); border: 1px solid rgba(201,168,76,0.3); border-radius: 8px; color: #e8dfc8; font-family: Georgia, serif; font-size: 16px; outline: none; transition: border-color 0.2s; }
       input:focus { border-color: rgba(201,168,76,0.7); }
       input::placeholder { color: rgba(232,223,200,0.3); }
       button { padding: 0.65rem 1.2rem; background: linear-gradient(135deg, #c9a84c, #a8843a); color: #0f0c1a; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; letter-spacing: 0.04em; transition: all 0.2s; }
@@ -43,7 +43,7 @@
         h3 { font-size: 1rem; }
         .header { flex-wrap: wrap; gap: 8px; }
         .row { gap: 8px; }
-        input { padding: 0.55rem 0.75rem; font-size: 0.9rem; min-width: 100% !important; }
+        input { padding: 0.55rem 0.75rem; font-size: 16px; min-width: 100% !important; }
         button { padding: 0.55rem 1rem; font-size: 0.85rem; }
         #log { font-size: 0.8rem; padding: 0.75rem; }
         img { max-width: 100%; }

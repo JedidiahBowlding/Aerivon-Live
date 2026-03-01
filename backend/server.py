@@ -28,6 +28,26 @@ from playwright.async_api import async_playwright
 
 from agent import AerivonLiveAgent
 from gemini_client import check_live_model_availability, resolve_fallback_model
+import inspect
+
+# ============ STEP 0: BUILD FINGERPRINT (MODULE IMPORT TIME) ============
+# This MUST appear in logs if this module is loaded
+BUILD_MARKER = f"AERIVON_BUILD_MARKER::{time.time()}::{os.getpid()}"
+print(f"\n{'='*80}", file=sys.stderr)
+print(BUILD_MARKER, file=sys.stderr)
+sys.stderr.flush()
+
+# Also print the absolute file path & a hash of the source
+THIS_FILE = os.path.abspath(__file__)
+try:
+    with open(__file__, "rb") as f:
+        SRC = f.read()
+    SRC_SHA = hashlib.sha256(SRC).hexdigest()[:12]
+except Exception as e:
+    SRC_SHA = f"ERR:{e}"
+print(f"AERIVON_FILE::{THIS_FILE}::SHA::{SRC_SHA}", file=sys.stderr)
+print(f"{'='*80}\n", file=sys.stderr)
+sys.stderr.flush()
 
 
 def retry_with_exponential_backoff(
@@ -700,12 +720,13 @@ async def ws_ui(websocket: WebSocket) -> None:
 
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
     if not use_vertex or not project:
         await websocket.send_json({"type": "error", "error": "Vertex not enabled"})
         await websocket.close(code=1011)
         return
 
-    gen_client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+    gen_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
 
     session_id = int(time.time())
     await websocket.send_json({"type": "status", "status": "connected", "session_id": session_id, "model": UI_MODEL})
@@ -2265,7 +2286,41 @@ async def ws_live(websocket: WebSocket) -> None:
 async def ws_aerivon_unified(websocket: WebSocket) -> None:
     """Unified Aerivon Agent - Orchestrates Live, UI, and Story capabilities with intent detection."""
     
+    # ============ ABSOLUTE FIRST ACTION: WRITE TO FILE ============
+    import traceback as tb
+    try:
+        with open("/tmp/aerivon_ENTRY_IMMEDIATE.txt", "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"ENTRY AT {time.time()}\n")
+            f.write(f"PID: {os.getpid()}\n")
+            f.write(f"File: {__file__}\n")
+            for line in tb.format_stack():
+                f.write(line)
+            f.write(f"{'='*80}\n")
+    except:
+        pass
+    
+    # ============ STEP 1: CONFIRM HANDLER FUNCTION ============
+    print(f"\n{'='*80}", file=sys.stderr)
+    print(f"AERIVON_WS_ENTRY {__file__} PID {os.getpid()} FUNC {inspect.currentframe().f_code.co_name}", file=sys.stderr)
+    print(f"{'='*80}\n", file=sys.stderr)
+    sys.stderr.flush()
+    
+    # ============ STEP 4a: PROVE ENDPOINT REACHED ============
+    from pathlib import Path
+    try:
+        Path("/tmp/aerivon_ws_reached.log").write_text(
+            f"REACHED::{time.time()}::{os.getpid()}::{__file__}\n"
+        )
+        print("✅ Created /tmp/aerivon_ws_reached.log", file=sys.stderr)
+    except Exception as e:
+        print(f"❌ Failed to create ws_reached log: {e}", file=sys.stderr)
+    sys.stderr.flush()
+    
     await websocket.accept()
+    
+    print("[AERIVON] 🎯 WebSocket ACCEPTED", file=sys.stderr)
+    sys.stderr.flush()
     
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -2275,18 +2330,23 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    gen_client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+    gen_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
     session_id = int(time.time())
     
     # Session state
     context = {
-        "user_id": None,
+        "user_id": f"ws_{session_id}",  # Default user_id from session
         "memory_scope": "aerivon_global",
         "cancel_flag": False,
         "state": "IDLE",
         "last_user_text": "",
         "conversation_history": [],
         "current_mode": None,
+        "active_task": None,
+        "pw": None,
+        "browser": None,
+        "browser_context": None,
+        "page": None,
     }
     
     # Helper function for narration (shared across story and UI handlers)
@@ -2325,6 +2385,11 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 
                 audio_chunks = []
                 async for response in session.receive():
+                    # Cooperative cancellation check
+                    if context["cancel_flag"]:
+                        print(f"[AERIVON NARRATION] Cancelled during audio streaming", file=sys.stderr)
+                        raise asyncio.CancelledError()
+                    
                     if response.data:
                         audio_chunks.append(response.data)
                         print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
@@ -2338,13 +2403,16 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                     # Send audio to client
                     await websocket.send_json({
                         "type": "audio",
+                        "data_b64": base64.b64encode(total_bytes).decode("ascii"),
                         "mime_type": "audio/pcm",
-                        "sample_rate": 24000,
-                        "data_b64": base64.b64encode(total_bytes).decode("ascii")
+                        "sample_rate": 24000
                     })
                 else:
                     print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
                     
+        except asyncio.CancelledError:
+            print(f"[AERIVON NARRATION] Task cancelled cleanly", file=sys.stderr)
+            raise  # Re-raise so run_with_cancel handler catches it
         except Exception as e:
             print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
             import traceback
@@ -2368,7 +2436,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
     async def detect_intent(message: dict) -> dict:
         """Detect user intent from message content."""
         msg_type = message.get("type", "")
-        text = message.get("text", "").lower()
+        text = (message.get("text", "") or "").lower()
         
         # Hard rules for quick detection
         if msg_type in ["audio", "audio_chunk", "audio_end"]:
@@ -2381,9 +2449,51 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 "requires_images": False
             }
         
+        # PRIORITY: Check for memory recall questions BEFORE other keyword matching
+        # Questions like "do you remember", "what did we", "did I" should use conversational mode to access memory
+        memory_recall_patterns = ["remember", "recall", "did we", "did i", "what did", "what was", "earlier"]
+        is_memory_question = any(p in text for p in memory_recall_patterns)
+        
+        if is_memory_question:
+            return {
+                "intent": "live",
+                "confidence": 0.90,
+                "reason": "Memory recall question detected",
+                "requires_audio": False,
+                "requires_browser": False,
+                "requires_images": False
+            }
+        
         # Check for story-related keywords
         story_keywords = ["story", "tale", "narrate", "illustrate", "fantasy", "adventure"]
-        if any(keyword in text for keyword in story_keywords):
+        # UI keywords: prioritize STRONG signals (actions + explicit URLs)
+        # Removed weak keywords like "show me", "what is", "what's" that appear in normal questions
+        ui_keywords = [
+            "open", "navigate", "click", "go to", "visit",
+            "scroll", "type in", "type into", "press", "search on",
+            "button", "link", "element"
+        ]
+        
+        # Check for explicit domain/URL patterns (strong UI signal)
+        import re
+        has_url_pattern = bool(re.search(r'\b\w+\.(com|org|net|io|gov|edu)\b', text))
+        has_http_url = bool(re.search(r'https?://', text))
+        
+        has_story = any(k in text for k in story_keywords)
+        has_ui = any(k in text for k in ui_keywords) or has_url_pattern or has_http_url
+        
+        # Check hybrid FIRST (before story/ui individually)
+        if has_story and has_ui:
+            return {
+                "intent": "hybrid",
+                "confidence": 0.90,
+                "reason": "Both navigation and story keywords detected",
+                "requires_audio": False,
+                "requires_browser": True,
+                "requires_images": True
+            }
+        
+        if has_story:
             return {
                 "intent": "story",
                 "confidence": 0.85,
@@ -2393,32 +2503,16 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 "requires_images": True
             }
         
-        # Check for UI navigation keywords
-        ui_keywords = [
-            "open", "navigate", "click", "website", "find on", "search for on", "go to",
-            "analyze", "find the", "identify", "read the", "get the", "extract", 
-            "look for", "show me", "what is the", "what's the", "hero text", "heading",
-            "button", "link", "element", "page", "webpage", "scroll", "type in"
-        ]
-        if any(keyword in text for keyword in ui_keywords):
+        if has_ui:
+            # Higher confidence if explicit URL/domain present
+            confidence = 0.95 if (has_url_pattern or has_http_url) else 0.80
             return {
                 "intent": "ui",
-                "confidence": 0.85,
-                "reason": "Navigation keywords detected",
+                "confidence": confidence,
+                "reason": "Navigation keywords or URL detected",
                 "requires_audio": False,
                 "requires_browser": True,
                 "requires_images": False
-            }
-        
-        # Check for hybrid (UI + Story)
-        if any(ui_kw in text for ui_kw in ui_keywords) and any(story_kw in text for story_kw in story_keywords):
-            return {
-                "intent": "hybrid",
-                "confidence": 0.90,
-                "reason": "Both navigation and story keywords detected",
-                "requires_audio": False,
-                "requires_browser": True,
-                "requires_images": True
             }
         
         # Default to conversational
@@ -2430,6 +2524,16 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             "requires_browser": False,
             "requires_images": False
         }
+    
+    async def run_with_cancel(coro):
+        """Run a coroutine with cancellation support."""
+        task = asyncio.create_task(coro)
+        context["active_task"] = task
+        try:
+            return await task
+        finally:
+            if context.get("active_task") is task:
+                context["active_task"] = None
     
     async def handle_text_message(text: str):
         """Handle text-based requests with intent routing."""
@@ -2451,15 +2555,21 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             "reason": intent_result["reason"]
         })
         
-        # Route based on intent
-        if intent_result["intent"] == "story":
-            await handle_story_request(text)
-        elif intent_result["intent"] == "ui":
-            await handle_ui_request(text)
-        elif intent_result["intent"] == "hybrid":
-            await handle_hybrid_request(text)
-        else:  # live/conversational
-            await handle_conversational(text)
+        # Route based on intent with cancellation support
+        try:
+            if intent_result["intent"] == "story":
+                await run_with_cancel(handle_story_request(text))
+            elif intent_result["intent"] == "ui":
+                await run_with_cancel(handle_ui_request(text))
+            elif intent_result["intent"] == "hybrid":
+                await run_with_cancel(handle_hybrid_request(text))
+            else:  # live/conversational
+                await run_with_cancel(handle_conversational(text))
+        except asyncio.CancelledError:
+            await websocket.send_json({"type": "text", "text": "⚠️ Task cancelled"})
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+            raise
     
     async def handle_story_request(prompt: str):
         """Handle story generation requests."""
@@ -2468,8 +2578,20 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "thinking", "text": "Creating an illustrated story..."})
         
         try:
+            # Build story prompt with conversation context if available
+            story_context = ""
+            if context["conversation_history"]:
+                # Include recent context for story continuity
+                recent_msgs = []
+                for ex in context["conversation_history"][-3:]:
+                    user_msg = ex.get("user", "")
+                    if user_msg:
+                        recent_msgs.append(f"User mentioned: {user_msg}")
+                if recent_msgs:
+                    story_context = "\n\nContext from conversation:\n" + "\n".join(recent_msgs)
+            
             story_prompt = f"""Create an illustrated fantasy story based on this prompt:
-{prompt}
+{prompt}{story_context}
 
 For each scene in the story:
 1. Write 2-3 sentences of vivid narration
@@ -2518,6 +2640,11 @@ Make it engaging and visual."""
             # Helper to narrate text using Gemini Live API
             async def narrate_text(text: str) -> bytes | None:
                 """Generate speech audio for story narration."""
+                # Check cancel flag before narration
+                if context["cancel_flag"]:
+                    print(f"[AERIVON NARRATION] Cancelled before narration", file=sys.stderr)
+                    return None
+                
                 text = (text or "").strip()
                 if not text or len(text) < 3:
                     print(f"[AERIVON NARRATION] Skipping empty/short text: '{text}'", file=sys.stderr)
@@ -2551,6 +2678,11 @@ Make it engaging and visual."""
                         
                         audio_chunks = []
                         async for response in session.receive():
+                            # Cooperative cancellation check
+                            if context["cancel_flag"]:
+                                print(f"[AERIVON NARRATION] Cancelled during audio streaming", file=sys.stderr)
+                                raise asyncio.CancelledError()
+                            
                             if response.data:
                                 audio_chunks.append(response.data)
                                 print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
@@ -2565,6 +2697,9 @@ Make it engaging and visual."""
                             print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
                             return None
                         
+                except asyncio.CancelledError:
+                    print(f"[AERIVON NARRATION] Task cancelled cleanly", file=sys.stderr)
+                    return None  # Return None instead of re-raising, story loop will handle cancel_flag
                 except Exception as e:
                     print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
                     import traceback
@@ -2626,6 +2761,22 @@ Make it engaging and visual."""
                         "index": 9999
                     })
             
+            # Save story generation to memory
+            if context["user_id"] and AERIVON_MEMORY_BUCKET:
+                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
+                story_summary = f"Generated illustrated story with {len(parts)} parts (text and images)"
+                await _append_exchange_to_memory(
+                    user_id=memory_user_id,
+                    user_text=prompt,
+                    model_text=story_summary
+                )
+                context["conversation_history"].append({
+                    "t": int(time.time()),
+                    "user": prompt,
+                    "model": story_summary
+                })
+                print(f"[MEMORY] Saved story generation for user {context['user_id']}", file=sys.stderr)
+            
             context["state"] = "DONE"
             await websocket.send_json({"type": "status", "state": "DONE"})
             await websocket.send_json({"type": "done"})
@@ -2635,6 +2786,20 @@ Make it engaging and visual."""
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
     
+    async def ensure_browser():
+        """Ensure browser is running and ready (reuse across requests)."""
+        if context["page"]:
+            return
+        context["pw"] = await async_playwright().start()
+        context["browser"] = await context["pw"].chromium.launch(headless=True)
+        context["browser_context"] = await context["browser"].new_context(
+            viewport={"width": 1366, "height": 768},
+            device_scale_factor=1,
+            java_script_enabled=True,
+            ignore_https_errors=True,
+        )
+        context["page"] = await context["browser_context"].new_page()
+    
     async def handle_ui_request(goal: str):
         """Handle UI navigation requests with Playwright browser automation."""
         context["state"] = "NAVIGATING"
@@ -2642,6 +2807,9 @@ Make it engaging and visual."""
         await websocket.send_json({"type": "thinking", "text": f"Launching browser for: {goal}"})
         
         try:
+            # Ensure browser is ready (reuse if already open)
+            await ensure_browser()
+            page = context["page"]
             # Infer URL from goal
             goal_lower = goal.lower()
             url = ""
@@ -2651,7 +2819,12 @@ Make it engaging and visual."""
             is_analysis_task = any(kw in goal_lower for kw in analysis_keywords)
             
             # Try to extract or infer URL
-            if "nike" in goal_lower:
+            # FIRST: Check for explicit URLs anywhere in the goal (e.g., "Open http://localhost")
+            import re
+            url_match = re.search(r'https?://[^\s]+', goal_lower)
+            if url_match:
+                url = url_match.group(0)
+            elif "nike" in goal_lower:
                 url = "https://www.nike.com"
             elif "amazon" in goal_lower:
                 url = "https://www.amazon.com"
@@ -2661,18 +2834,51 @@ Make it engaging and visual."""
                 url = "https://www.youtube.com"
             elif "github" in goal_lower:
                 url = "https://www.github.com"
-            elif goal_lower.startswith("http://") or goal_lower.startswith("https://"):
-                url = goal_lower.split()[0]
             elif is_analysis_task:
-                # Analysis task without URL - ask for clarification
-                await websocket.send_json({
-                    "type": "text",
-                    "text": f"I can help you {goal}, but I need to know which website to analyze.\n\nPlease specify a URL or website name. For example:\n• \"Find the hero text on Nike.com\"\n• \"Analyze the heading on https://example.com\"\n• Or first say \"Open Nike.com\" then ask me to analyze it."
-                })
-                context["state"] = "IDLE"
-                await websocket.send_json({"type": "status", "state": "IDLE"})
-                await websocket.send_json({"type": "done"})
-                return
+                # Check conversation history for recent website mentions
+                recent_url = None
+                if context["conversation_history"]:
+                    # Look at last 3 exchanges for URLs or website names
+                    for ex in reversed(context["conversation_history"][-3:]):
+                        user_msg = ex.get("user", "").lower()
+                        model_msg = ex.get("model", "").lower()
+                        
+                        # Check for explicit URLs
+                        import re
+                        url_pattern = r'https?://[^\s]+'
+                        user_urls = re.findall(url_pattern, user_msg)
+                        model_urls = re.findall(url_pattern, model_msg)
+                        if user_urls:
+                            recent_url = user_urls[-1]
+                            break
+                        elif model_urls:
+                            recent_url = model_urls[-1]
+                            break
+                        
+                        # Check for website names
+                        if "nike" in user_msg or "nike" in model_msg:
+                            recent_url = "https://www.nike.com"
+                            break
+                        elif "amazon" in user_msg or "amazon" in model_msg:
+                            recent_url = "https://www.amazon.com"
+                            break
+                
+                if recent_url:
+                    url = recent_url
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": f"📌 Using website from context: {url}"
+                    })
+                else:
+                    # Analysis task without URL and no context - ask for clarification
+                    await websocket.send_json({
+                        "type": "text",
+                        "text": f"I can help you {goal}, but I need to know which website to analyze.\n\nPlease specify a URL or website name. For example:\n• \"Find the hero text on Nike.com\"\n• \"Analyze the heading on https://example.com\"\n• Or first say \"Open Nike.com\" then ask me to analyze it."
+                    })
+                    context["state"] = "IDLE"
+                    await websocket.send_json({"type": "status", "state": "IDLE"})
+                    await websocket.send_json({"type": "done"})
+                    return
             else:
                 # Not an analysis task and no URL - do a Google search
                 import urllib.parse
@@ -2683,39 +2889,133 @@ Make it engaging and visual."""
             if not is_safe_url(url):
                 await websocket.send_json({
                     "type": "error",
-                    "error": f"Blocked unsafe URL: {url}"
+                    "error": f"🔒 Blocked unsafe URL: {url}"
                 })
                 context["state"] = "IDLE"
+                await websocket.send_json({"type": "status", "state": "IDLE"})
+                await websocket.send_json({"type": "done"})
                 return
             
-            # Launch browser and execute navigation
-            async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True)
-                browser_context = await browser.new_context(
-                    viewport={"width": 1366, "height": 768},
-                    device_scale_factor=1,
-                    java_script_enabled=True,
-                    ignore_https_errors=True,
-                )
-                page = await browser_context.new_page()
+            # Navigate to URL (browser already ensured above)
+            await websocket.send_json({
+                "type": "text",
+                "text": f"🌐 Opening {url}..."
+            })
+            
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(1000)
+            
+            page_title = await page.title()
+            await websocket.send_json({
+                "type": "text",
+                "text": f"✅ Loaded: {page_title}"
+            })
+            
+            # Take screenshot
+            b64, png = await _ui_screenshot_b64(page)
+            await websocket.send_json({
+                "type": "screenshot",
+                "mime_type": "image/png",
+                "data_b64": b64,
+                "url": page.url
+            })
+            
+            # Determine if we need action planning or if this is just "open the page"
+            analysis_keywords = [
+                "find", "what is", "what's", "analyze", "identify", "read", 
+                "show me", "get the", "extract", "tell me", "hero text", "heading",
+                "largest text", "main text", "title", "click", "search", "type"
+            ]
+            simple_navigation_only = [
+                "open", "go to", "visit", "navigate to", "load", "show me the website"
+            ]
+            
+            # Check if this is an analysis/interaction task (not just opening a page)
+            has_analysis_intent = any(kw in goal_lower for kw in analysis_keywords)
+            is_simple_navigation = (
+                any(nav in goal_lower for nav in simple_navigation_only) and 
+                not has_analysis_intent
+            )
+            
+            # Run action planning if there's more to do than just opening the page
+            if not is_simple_navigation:
+                await websocket.send_json({
+                    "type": "text",
+                    "text": f"🤖 Planning actions to: {goal}"
+                })
                 
-                try:
-                    # Navigate to URL
+                memory = [
+                    f"User goal: {goal}",
+                    f"Current URL: {page.url}",
+                    f"Page title: {page_title}"
+                ]
+                
+                # Run planning loop (limited to 3 steps for Command Center)
+                for step in range(3):
+                    if context["cancel_flag"]:
+                        await websocket.send_json({"type": "text", "text": "⚠️ Cancelled by user"})
+                        break
+                    
+                    # Get action plan from Gemini
+                    plan = await _ui_plan_actions(
+                        client=gen_client,
+                        screenshot_png=png,
+                        task=goal,
+                        memory=memory,
+                        page=page
+                    )
+                    
                     await websocket.send_json({
                         "type": "text",
-                        "text": f"🌐 Opening {url}..."
+                        "text": f"📋 Step {step + 1}: {plan.get('note', 'Executing actions...')}"
                     })
                     
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    await page.wait_for_timeout(1000)
+                    # Execute actions
+                    clickable_elements = plan.get("_clickable_elements") or []
+                    actions = plan.get("actions") or []
                     
-                    page_title = await page.title()
-                    await websocket.send_json({
-                        "type": "text",
-                        "text": f"✅ Loaded: {page_title}"
-                    })
+                    for action in actions:
+                        if context["cancel_flag"]:
+                            break
+                        
+                        action_type = str(action.get("type", "")).lower()
+                        
+                        # Validate goto URLs before navigation (SSRF protection)
+                        if action_type == "goto":
+                            goto_url = str(action.get("url", ""))
+                            from tools import is_safe_url
+                            if not is_safe_url(goto_url):
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "error": f"🔒 Blocked unsafe URL: {goto_url}"
+                                })
+                                continue
+                            await page.goto(goto_url, wait_until="domcontentloaded", timeout=45000)
+                            await page.wait_for_timeout(1000)
+                        # Execute action (simplified version)
+                        elif action_type == "click":
+                            if "element_index" in action:
+                                idx = int(action.get("element_index", 0))
+                                if 0 <= idx < len(clickable_elements):
+                                    el = clickable_elements[idx]
+                                    x = el['x'] + el['w'] // 2
+                                    y = el['y'] + el['h'] // 2
+                                    await page.mouse.click(x, y)
+                                    await page.wait_for_timeout(800)
+                        elif action_type == "type":
+                            text = str(action.get("text", ""))
+                            await page.keyboard.type(text)
+                            await page.wait_for_timeout(300)
+                        elif action_type == "press":
+                            key = str(action.get("key", "Enter"))
+                            await page.keyboard.press(key)
+                            await page.wait_for_timeout(600)
+                        elif action_type == "scroll":
+                            dy = int(action.get("delta_y", 0))
+                            await page.mouse.wheel(0, dy)
+                            await page.wait_for_timeout(300)
                     
-                    # Take screenshot
+                    # Screenshot after actions
                     b64, png = await _ui_screenshot_b64(page)
                     await websocket.send_json({
                         "type": "screenshot",
@@ -2724,115 +3024,35 @@ Make it engaging and visual."""
                         "url": page.url
                     })
                     
-                    # Determine if we need action planning or if this is just "open the page"
-                    analysis_keywords = [
-                        "find", "what is", "what's", "analyze", "identify", "read", 
-                        "show me", "get the", "extract", "tell me", "hero text", "heading",
-                        "largest text", "main text", "title", "click", "search", "type"
-                    ]
-                    simple_navigation_only = [
-                        "open", "go to", "visit", "navigate to", "load", "show me the website"
-                    ]
+                    memory.append(f"Step {step + 1} completed. URL: {page.url}")
                     
-                    # Check if this is an analysis/interaction task (not just opening a page)
-                    has_analysis_intent = any(kw in goal_lower for kw in analysis_keywords)
-                    is_simple_navigation = (
-                        any(nav in goal_lower for nav in simple_navigation_only) and 
-                        not has_analysis_intent
-                    )
-                    
-                    # Run action planning if there's more to do than just opening the page
-                    if not is_simple_navigation:
+                    # Check if done
+                    if plan.get("done"):
+                        completion_note = plan.get('note', 'Task finished!')
                         await websocket.send_json({
                             "type": "text",
-                            "text": f"🤖 Planning actions to: {goal}"
+                            "text": f"✨ Complete: {completion_note}"
                         })
                         
-                        memory = [
-                            f"User goal: {goal}",
-                            f"Current URL: {page.url}",
-                            f"Page title: {page_title}"
-                        ]
-                        
-                        # Run planning loop (limited to 3 steps for Command Center)
-                        for step in range(3):
-                            if context["cancel_flag"]:
-                                await websocket.send_json({"type": "text", "text": "⚠️ Cancelled by user"})
-                                break
-                            
-                            # Get action plan from Gemini
-                            plan = await _ui_plan_actions(
-                                client=gen_client,
-                                screenshot_png=png,
-                                task=goal,
-                                memory=memory,
-                                page=page
-                            )
-                            
-                            await websocket.send_json({
-                                "type": "text",
-                                "text": f"📋 Step {step + 1}: {plan.get('note', 'Executing actions...')}"
-                            })
-                            
-                            # Execute actions
-                            clickable_elements = plan.get("_clickable_elements") or []
-                            actions = plan.get("actions") or []
-                            
-                            for action in actions:
-                                if context["cancel_flag"]:
-                                    break
-                                
-                                action_type = str(action.get("type", "")).lower()
-                                
-                                # Execute action (simplified version)
-                                if action_type == "click":
-                                    if "element_index" in action:
-                                        idx = int(action.get("element_index", 0))
-                                        if 0 <= idx < len(clickable_elements):
-                                            el = clickable_elements[idx]
-                                            x = el['x'] + el['w'] // 2
-                                            y = el['y'] + el['h'] // 2
-                                            await page.mouse.click(x, y)
-                                            await page.wait_for_timeout(800)
-                                elif action_type == "type":
-                                    text = str(action.get("text", ""))
-                                    await page.keyboard.type(text)
-                                    await page.wait_for_timeout(300)
-                                elif action_type == "press":
-                                    key = str(action.get("key", "Enter"))
-                                    await page.keyboard.press(key)
-                                    await page.wait_for_timeout(600)
-                                elif action_type == "scroll":
-                                    dy = int(action.get("delta_y", 0))
-                                    await page.mouse.wheel(0, dy)
-                                    await page.wait_for_timeout(300)
-                            
-                            # Screenshot after actions
-                            b64, png = await _ui_screenshot_b64(page)
-                            await websocket.send_json({
-                                "type": "screenshot",
-                                "mime_type": "image/png",
-                                "data_b64": b64,
-                                "url": page.url
-                            })
-                            
-                            memory.append(f"Step {step + 1} completed. URL: {page.url}")
-                            
-                            # Check if done
-                            if plan.get("done"):
-                                completion_note = plan.get('note', 'Task finished!')
-                                await websocket.send_json({
-                                    "type": "text",
-                                    "text": f"✨ Complete: {completion_note}"
-                                })
-                                
-                                # Narrate the result
-                                await narrate_and_send(completion_note)
-                                break
-                    
-                finally:
-                    await browser_context.close()
-                    await browser.close()
+                        # Narrate the result
+                        await narrate_and_send(completion_note)
+                        break
+            
+            # Save UI interaction to memory
+            if context["user_id"] and AERIVON_MEMORY_BUCKET:
+                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
+                completion_summary = f"Navigated to {page.url}. {completion_note if 'completion_note' in locals() else 'Task completed.'}"
+                await _append_exchange_to_memory(
+                    user_id=memory_user_id,
+                    user_text=goal,
+                    model_text=completion_summary
+                )
+                context["conversation_history"].append({
+                    "t": int(time.time()),
+                    "user": goal,
+                    "model": completion_summary
+                })
+                print(f"[MEMORY] Saved UI navigation for user {context['user_id']}", file=sys.stderr)
             
             context["state"] = "DONE"
             await websocket.send_json({"type": "status", "state": "DONE"})
@@ -2872,21 +3092,58 @@ Make it engaging and visual."""
         await websocket.send_json({"type": "status", "state": "THINKING"})
         
         try:
-            # Use gemini-2.0-flash for conversational responses
-            response = gen_client.models.generate_content(
-                model="gemini-2.0-flash-001",
-                contents=text,
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=1000
-                )
-            )
+            # Build conversation context from memory
+            system_instruction = "You are Aerivon Live. Be concise and helpful."
             
+            # Add conversation history if available
+            if context["conversation_history"]:
+                history_text = "\n\nPrevious conversation:\n"
+                for ex in context["conversation_history"][-6:]:  # Last 6 exchanges
+                    user_msg = ex.get("user", "")
+                    model_msg = ex.get("model", "")
+                    if user_msg:
+                        history_text += f"User: {user_msg}\n"
+                    if model_msg:
+                        history_text += f"Assistant: {model_msg}\n"
+                system_instruction += history_text
+            
+            # Use gemini-2.5-flash for conversational responses with memory
+            # Wrap in asyncio.to_thread to avoid blocking event loop
+            def _generate():
+                return gen_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction + "\nIf the user asks for help debugging/building, be detailed and actionable.",
+                        temperature=0.6,
+                        max_output_tokens=3000  # Increased from 1800 for complete responses
+                    )
+                )
+            response = await asyncio.to_thread(_generate)
+            
+            model_response_text = ""
             if response.text:
+                model_response_text = response.text
                 await websocket.send_json({
                     "type": "text",
                     "text": response.text
                 })
+            
+            # Save exchange to memory
+            if context["user_id"] and AERIVON_MEMORY_BUCKET:
+                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
+                await _append_exchange_to_memory(
+                    user_id=memory_user_id,
+                    user_text=text,
+                    model_text=model_response_text
+                )
+                # Update local context
+                context["conversation_history"].append({
+                    "t": int(time.time()),
+                    "user": text,
+                    "model": model_response_text
+                })
+                print(f"[MEMORY] Saved exchange for user {context['user_id']}", file=sys.stderr)
             
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
@@ -2905,17 +3162,20 @@ Make it engaging and visual."""
             await websocket.send_json({"type": "thinking", "text": "Listening to your voice..."})
             
             # Use Gemini to transcribe the audio (simple transcription, not verbose response)
-            response = gen_client.models.generate_content(
-                model="gemini-2.0-flash-001",
-                contents=[
-                    types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
-                    types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,  # Lower temperature for accurate transcription
-                    max_output_tokens=500
+            # Wrap in asyncio.to_thread to avoid blocking event loop
+            def _transcribe():
+                return gen_client.models.generate_content(
+                    model="gemini-2.0-flash-001",
+                    contents=[
+                        types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
+                        types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,  # Lower temperature for accurate transcription
+                        max_output_tokens=200  # Reduced from 500 - just transcription
+                    )
                 )
-            )
+            response = await asyncio.to_thread(_transcribe)
             
             if response.text:
                 # Extract the transcribed text for intent detection
@@ -2942,58 +3202,179 @@ Make it engaging and visual."""
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
     
-    # Main message loop
+    # ============ DUAL-TASK ARCHITECTURE ============
+    # Fixes interrupt timing issue with concurrent message processing
+    
+    print("[AERIVON] ⚡️ REACHED DUAL-TASK SETUP! About to open debug log...", file=sys.stderr)
+    sys.stderr.flush()
+    
+    # Debug log file
+    debug_log = open("/tmp/aerivon_debug.log", "a")
+    def log(msg):
+        debug_log.write(f"{msg}\n")
+        debug_log.flush()
+    
+    log("[AERIVON] Debug log file created successfully!")
+    print("[AERIVON] ✅ Debug log opened and first message written", file=sys.stderr)
+    sys.stderr.flush()
+    
+    # Message queue for all non-interrupt messages
+    message_queue = asyncio.Queue()
+    
+    async def message_listener():
+        """
+        Dedicated listener task - always polls for incoming WebSocket messages.
+        Processes interrupts IMMEDIATELY without queueing.
+        Queues all other messages for the main processor.
+        """
+        log("[AERIVON] message_listener task started")
+        try:
+            while True:
+                log("[AERIVON LISTENER] Waiting for next message...")
+                data = await websocket.receive_json()
+                msg_type = data.get("type", "")
+                
+                log(f"[AERIVON LISTENER] Received: {msg_type}")
+                
+                if msg_type == "interrupt":
+                    # CRITICAL: Process interrupt immediately, do NOT queue it
+                    log(f"[INTERRUPT] Received interrupt, active_task: {context.get('active_task')}")
+                    
+                    # Set cancel flag FIRST
+                    context["cancel_flag"] = True
+                    
+                    # Cancel active task if running
+                    if context.get("active_task"):
+                        log("[INTERRUPT] Cancelling active_task...")
+                        context["active_task"].cancel()
+                    
+                    # Send acknowledgment IMMEDIATELY
+                    log("[INTERRUPT] Sending acknowledgment...")
+                    await websocket.send_json({"type": "interrupted", "source": "client"})
+                    log("[INTERRUPT] Acknowledgment sent ✅")
+                    
+                    # Reset state
+                    context["state"] = "IDLE"
+                    await websocket.send_json({"type": "status", "state": "IDLE"})
+                    context["cancel_flag"] = False
+                    
+                    # Do NOT queue interrupt - it's fully handled here
+                    
+                else:
+                    # All non-interrupt messages go to the queue
+                    log(f"[LISTENER] Queueing {msg_type} for processor")
+                    await message_queue.put(data)
+                    
+        except WebSocketDisconnect:
+            log("[AERIVON LISTENER] WebSocket disconnected")
+        except Exception as e:
+            log(f"[AERIVON LISTENER] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def main_processor():
+        """
+        Main processor task - consumes messages from the queue.
+        Does NOT poll WebSocket directly (that's the listener's job).
+        """
+        log("[AERIVON] main_processor task started")
+        try:
+            while True:
+                # Get next message from queue
+                data = await message_queue.get()
+                msg_type = data.get("type", "")
+                
+                log(f"[AERIVON PROCESSOR] Processing: {msg_type}")
+                print(f"[AERIVON PROCESSOR] Processing: {msg_type}", file=sys.stderr)
+                
+                if msg_type == "text":
+                    text = data.get("text", "").strip()
+                    if text:
+                        await handle_text_message(text)
+                
+                elif msg_type == "audio":
+                    # Buffer PCM audio chunks
+                    b64 = str(data.get("data_b64") or "")
+                    if b64:
+                        try:
+                            chunk = base64.b64decode(b64, validate=True)
+                            # Cap at ~2MB to prevent memory issues
+                            if len(audio_pcm) + len(chunk) <= 2 * 1024 * 1024:
+                                audio_pcm.extend(chunk)
+                        except Exception:
+                            pass
+                
+                elif msg_type == "audio_end":
+                    # Process the buffered audio
+                    if audio_pcm:
+                        context["state"] = "LISTENING"
+                        await websocket.send_json({"type": "status", "state": "LISTENING"})
+                        
+                        # Convert PCM to WAV
+                        wav = _pcm_s16le_to_wav(bytes(audio_pcm), sample_rate=16000, channels=1)
+                        audio_pcm.clear()
+                        
+                        # Use Live API to transcribe and respond to audio
+                        await handle_audio_input(wav)
+                
+                elif msg_type == "start":
+                    # Allow override of default user_id
+                    if data.get("user_id"):
+                        context["user_id"] = data.get("user_id")
+                    context["memory_scope"] = data.get("memory_scope", "aerivon_global")
+                    
+                    # Load user memory from GCS
+                    if context["user_id"]:
+                        memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
+                        user_memory = await _load_user_memory(user_id=memory_user_id)
+                        if user_memory:
+                            context["conversation_history"] = user_memory.get("exchanges", [])
+                            print(f"[MEMORY] Loaded {len(context['conversation_history'])} exchanges for user {context['user_id']}", file=sys.stderr)
+                        else:
+                            print(f"[MEMORY] No existing memory for user {context['user_id']}", file=sys.stderr)
+                    
+                    await websocket.send_json({
+                        "type": "status",
+                        "state": "IDLE",
+                        "message": f"Session started for user {context['user_id']} with {len(context['conversation_history'])} previous exchanges"
+                    })
+                    
+        except Exception as e:
+            log(f"[AERIVON PROCESSOR] Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Start both tasks concurrently
+    log("[AERIVON] Starting dual-task architecture (listener + processor)")
+    
+    # ============ STEP 4b: PROVE DUAL-TASK STARTED ============
     try:
-        while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type", "")
-            
-            if msg_type == "interrupt":
-                context["cancel_flag"] = True
-                await websocket.send_json({"type": "interrupted", "source": "client"})
-                context["cancel_flag"] = False
-                context["state"] = "IDLE"
-                await websocket.send_json({"type": "status", "state": "IDLE"})
-                continue
-            
-            if msg_type == "text":
-                text = data.get("text", "").strip()
-                if text:
-                    await handle_text_message(text)
-            
-            elif msg_type == "audio":
-                # Buffer PCM audio chunks
-                b64 = str(data.get("data_b64") or "")
-                if b64:
-                    try:
-                        chunk = base64.b64decode(b64, validate=True)
-                        # Cap at ~2MB to prevent memory issues
-                        if len(audio_pcm) + len(chunk) <= 2 * 1024 * 1024:
-                            audio_pcm.extend(chunk)
-                    except Exception:
-                        pass
-            
-            elif msg_type == "audio_end":
-                # Process the buffered audio
-                if audio_pcm:
-                    context["state"] = "LISTENING"
-                    await websocket.send_json({"type": "status", "state": "LISTENING"})
-                    
-                    # Convert PCM to WAV
-                    wav = _pcm_s16le_to_wav(bytes(audio_pcm), sample_rate=16000, channels=1)
-                    audio_pcm.clear()
-                    
-                    # Use Live API to transcribe and respond to audio
-                    await handle_audio_input(wav)
-            
-            elif msg_type == "start":
-                context["user_id"] = data.get("user_id")
-                context["memory_scope"] = data.get("memory_scope", "aerivon_global")
-                await websocket.send_json({
-                    "type": "status",
-                    "state": "IDLE",
-                    "message": f"Session started for user {context['user_id']}"
-                })
+        Path("/tmp/aerivon_dualtask_started.log").write_text(
+            f"DUALTASK_STARTED::{time.time()}::{os.getpid()}::{__file__}\n"
+        )
+        print("✅ Created /tmp/aerivon_dualtask_started.log", file=sys.stderr)
+    except Exception as e:
+        print(f"❌ Failed to create dualtask_started log: {e}", file=sys.stderr)
+    sys.stderr.flush()
+    
+    await websocket.send_json({
+        "type": "debug",
+        "text": "🔧 Dual-task architecture starting..."
+    })
+    
+    try:
+        listener_task = asyncio.create_task(message_listener())
+        processor_task = asyncio.create_task(main_processor())
+        
+        log("[AERIVON] Both tasks created, starting gather...")
+        
+        await websocket.send_json({
+            "type": "debug",
+            "text": "🔧 Both tasks created, running concurrently..."
+        })
+        
+        # Run both tasks concurrently
+        await asyncio.gather(listener_task, processor_task)
     
     except WebSocketDisconnect:
         pass
@@ -3004,6 +3385,19 @@ Make it engaging and visual."""
             pass
         try:
             await websocket.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        # Clean up browser resources
+        try:
+            if context.get("page"):
+                await context["page"].close()
+            if context.get("browser_context"):
+                await context["browser_context"].close()
+            if context.get("browser"):
+                await context["browser"].close()
+            if context.get("pw"):
+                await context["pw"].stop()
         except Exception:
             pass
 
