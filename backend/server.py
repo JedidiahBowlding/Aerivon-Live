@@ -3501,9 +3501,8 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                     "text": response.text
                 })
                 
-                # If user spoke to us, speak back
-                if context.get("audio_mode"):
-                    await narrate_and_send(response.text)
+                # Always narrate response (agent speaks back)
+                await narrate_and_send(response.text)
             
             # Save exchange to memory
             if context["user_id"] and AERIVON_MEMORY_BUCKET:
