@@ -2362,7 +2362,8 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         
         print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
         try:
-            narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            # Live API requires API key (not supported in Vertex AI)
+            narrate_client = _make_genai_client(prefer_vertex=False, project=project, location=location)
             
             async with narrate_client.aio.live.connect(
                 model="gemini-2.0-flash-exp",
