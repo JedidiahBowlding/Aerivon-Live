@@ -3,11 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Aerivon Live – Demos</title>
+    <title>Aerivon Live – Command Center</title>
+    <meta http-equiv="refresh" content="0; url=./unified_agent.html" />
     <link rel="icon" href="./assets/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" href="./assets/favicon-96x96.png" sizes="96x96" />
     <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
     <link rel="manifest" href="./assets/site.webmanifest" />
+    <script>
+      // Immediate redirect for better UX
+      window.location.href = './unified_agent.html';
+    </script>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -16,178 +21,66 @@
         background: #0f0c1a;
         color: #e8dfc8;
         min-height: 100dvh;
-        overflow-x: hidden;
-        padding: 2rem 1.5rem;
-        padding-bottom: calc(2rem + env(safe-area-inset-bottom));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
       }
 
-      .header {
-        text-align: center;
-        margin-bottom: 3rem;
-        padding-bottom: 2rem;
-        border-bottom: 1px solid rgba(255,255,255,0.08);
+      .loading {
+        max-width: 500px;
+        padding: 2rem;
       }
 
       .logo {
-        width: 48px;
-        height: 48px;
-        border-radius: 12px;
-        margin-bottom: 1rem;
+        width: 64px;
+        height: 64px;
+        border-radius: 16px;
+        margin: 0 auto 1.5rem;
         box-shadow: 0 4px 16px rgba(201,168,76,0.2);
+        animation: pulse 2s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.8; transform: scale(1.05); }
       }
 
       h1 {
-        font-size: 2.5rem;
+        font-size: 2rem;
         letter-spacing: 0.08em;
         background: linear-gradient(135deg, #c9a84c, #e8dfc8, #c9a84c);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         background-clip: text;
-        margin-bottom: 0.5rem;
+        margin-bottom: 1rem;
       }
 
-      .muted {
-        color: rgba(232,223,200,0.5);
-        font-size: 0.9rem;
-        font-style: italic;
-        margin-top: 0.5rem;
-      }
-
-      code {
-        background: rgba(201,168,76,0.15);
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-family: 'Courier New', monospace;
-        color: #c9a84c;
-        font-size: 0.85em;
-      }
-
-      h2 {
-        font-size: 1.5rem;
-        color: #c9a84c;
-        margin: 2rem 0 1rem;
-        letter-spacing: 0.05em;
-      }
-
-      ul {
-        list-style: none;
-        padding: 0;
-        margin: 0;
-      }
-
-      li {
-        margin: 0.75rem 0;
-        padding-left: 1.5rem;
-        position: relative;
-      }
-
-      li::before {
-        content: "→";
-        position: absolute;
-        left: 0;
-        color: #c9a84c;
-        font-weight: bold;
+      p {
+        color: rgba(232,223,200,0.7);
+        font-size: 1rem;
+        margin-bottom: 1.5rem;
       }
 
       a {
-        color: #e8dfc8;
+        color: #c9a84c;
         text-decoration: none;
+        border-bottom: 1px solid rgba(201,168,76,0.4);
         transition: all 0.2s;
-        border-bottom: 1px solid rgba(201,168,76,0.2);
         padding-bottom: 2px;
       }
 
       a:hover {
-        color: #c9a84c;
         border-bottom-color: #c9a84c;
-      }
-
-      .content {
-        max-width: 900px;
-        margin: 0 auto;
-      }
-
-      /* Responsive Design */
-      @media (max-width: 768px) {
-        body {
-          padding: 1rem;
-        }
-
-        h1 {
-          font-size: 1.8rem;
-        }
-
-        h2 {
-          font-size: 1.2rem;
-        }
-
-        .header {
-          margin-bottom: 2rem;
-        }
-
-        .logo {
-          width: 36px;
-          height: 36px;
-        }
-
-        a {
-          word-break: break-word;
-        }
-      }
-
-      @media (max-width: 480px) {
-        body {
-          padding: 0.75rem;
-        }
-
-        h1 {
-          font-size: 1.5rem;
-        }
-
-        h2 {
-          font-size: 1.1rem;
-        }
-
-        .muted, code {
-          font-size: 0.85rem;
-        }
       }
     </style>
   </head>
   <body>
-    <div class="content">
-      <div class="header">
-        <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
-        <h1>Aerivon Live</h1>
-        <p class="muted">
-          Each feature has its own page. Backend base can be overridden via <code>?backend=...</code>
-        </p>
-      </div>
-
-      <h2>🌟 Aerivon Command Center (NEW)</h2>
-      <ul>
-        <li><a href="./unified_agent.html">✨ Command Center — The Unified Multimodal Agent Interface (Voice + text input with intelligent intent detection - speak or type to navigate, create stories, or chat)</a></li>
-      </ul>
-
-      <h2>Live Agent</h2>
-      <ul>
-        <li><a href="./live_agent.html">Live Agent (mic + streaming + interrupt)</a></li>
-        <li><a href="./translator.html">Real-Time Translator (streaming chat)</a></li>
-        <li><a href="./vision_tutor.html">Vision Tutor (upload image + ask question)</a></li>
-        <li><a href="./customer_support.html">Customer Support Agent (streaming chat + memory)</a></li>
-      </ul>
-
-      <h2>UI Navigator</h2>
-      <ul>
-        <li><a href="./ui_navigator.html">UI Navigator (structured actions)</a></li>
-        <li><a href="./workflow_automator.html">Workflow Automator (navigator preset)</a></li>
-        <li><a href="./visual_qa.html">Visual QA Testing Agent (navigator preset)</a></li>
-      </ul>
-
-      <h2>Multimodal Storytelling</h2>
-      <ul>
-        <li><a href="./story.html">✨ Storybook (AI-illustrated stories with narration)</a></li>
-      </ul>
+    <div class="loading">
+      <img class="logo" src="./assets/favicon.png" alt="Aerivon" />
+      <h1>Aerivon Command Center</h1>
+      <p>Redirecting to Command Center...</p>
+      <p><a href="./unified_agent.html">Click here if not redirected automatically</a></p>
     </div>
   </body>
 </html>
