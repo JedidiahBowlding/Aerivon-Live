@@ -1613,7 +1613,8 @@ async def ws_live(websocket: WebSocket) -> None:
     model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.5-flash").strip()
 
     try:
-        client = _make_genai_client(prefer_vertex=vertex_live_enabled, project=project, location=location)
+        # Live API requires API key (not supported in Vertex AI)
+        client = _make_genai_client(prefer_vertex=False, project=project, location=location)
     except Exception as exc:
         await websocket.send_json({"type": "error", "error": str(exc)})
         await websocket.close(code=1011)
