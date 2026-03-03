@@ -157,18 +157,18 @@ def _get_api_key() -> str | None:
     return None
 
 
-def _make_genai_client(*, prefer_vertex: bool, project: str | None, location: str) -> genai.Client:
-    http_options = HttpOptions(api_version="v1beta1")
+def _make_genai_client(*, role: str, prefer_vertex: bool = True, project: str | None = None, location: str = "global") -> genai.Client:
+    vertex_http_options = HttpOptions(api_version="v1")
     if prefer_vertex and project:
-        return genai.Client(vertexai=True, project=project, location=location, http_options=http_options)
+        return genai.Client(vertexai=True, project=project, location=location, http_options=vertex_http_options)
 
     api_key = _get_api_key()
     if api_key:
-        return genai.Client(api_key=api_key, http_options=http_options)
+        return genai.Client(api_key=api_key)
 
     # No credentials configured.
     raise ValueError(
-        "Missing credentials. Set GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT (and ADC), "
+        f"Missing credentials for role '{role}'. Set GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT (and ADC), "
         "or set an API key env var (GEMINI_API_KEY / GOOGLE_API_KEY / GOOGLE_CLOUD_API_KEY)."
     )
 
@@ -187,7 +187,76 @@ AERIVON_MEMORY_MAX_EXCHANGES = int(os.getenv("AERIVON_MEMORY_MAX_EXCHANGES", "6"
 AERIVON_FIRESTORE_COLLECTION = os.getenv("AERIVON_FIRESTORE_COLLECTION", "").strip()
 
 UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
-UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-2.5-flash").strip()
+# Default UI planner/executor model: prefer Gemini 3.1 Pro for complex tasks.
+UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-3.1-pro").strip()
+STORY_CONCURRENCY_LIMIT = max(1, int(os.getenv("AERIVON_STORY_CONCURRENCY_LIMIT", "1")))
+STORY_SEMAPHORE = asyncio.Semaphore(STORY_CONCURRENCY_LIMIT)
+WS_AUDIO_CHUNK_BYTES = max(131072, int(os.getenv("AERIVON_WS_AUDIO_CHUNK_BYTES", "700000")))
+DEFAULT_STYLE = "cinematic fantasy illustration, dramatic lighting, highly detailed, painterly"
+CHAT_SYSTEM_PROMPT = """
+You are Aerivon, a conversational AI assistant.
+
+You may:
+- Answer questions
+- Access memory
+- Ask clarifying questions
+- Speak naturally
+
+You must NOT:
+- Execute browser actions
+- Generate structured plans
+- Pretend to execute tasks
+
+Remain conversational and helpful.
+""".strip()
+
+PLANNER_SYSTEM_PROMPT = """
+You are a deterministic planning engine.
+
+You output ONLY valid JSON.
+
+You do NOT:
+- Ask questions
+- Add commentary
+- Speak conversationally
+- Apologize
+- Explain your reasoning
+
+Return structured action plans only.
+
+If unsure, output:
+{ "error": "unable_to_plan" }
+""".strip()
+
+EXECUTION_SYSTEM_PROMPT = """
+You are an execution engine.
+
+You execute instructions immediately.
+
+You must NOT:
+- Ask questions
+- Offer help
+- Switch to conversational tone
+- Narrate what you will do
+- Apologize
+
+You only generate the requested output.
+
+If generating illustrated stories:
+- Exactly 2 scenes
+- 2–3 vivid sentences per scene
+- Follow each scene with an illustration
+- No labels like "Scene 1"
+
+If no style is specified:
+Use cinematic fantasy illustration, dramatic lighting, painterly detail.
+""".strip()
+
+EXECUTION_DRIFT_MARKERS = (
+    "what would you like",
+    "how can i help",
+    "is there anything else",
+)
 INJECTION_PATTERNS = (
     "ignore previous instructions",
     "reveal system prompt",
@@ -668,6 +737,7 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
         screenshot_png = await _annotate_screenshot(page, screenshot_png)
     
     cfg = types.GenerateContentConfig(
+        system_instruction=PLANNER_SYSTEM_PROMPT,
         temperature=0.2,
         max_output_tokens=1024,
         response_mime_type="application/json",
@@ -683,13 +753,16 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
         )
     ]
 
+    @retry_with_exponential_backoff
+    def _run_plan() -> Any:
+        return client.models.generate_content(
+            model=UI_MODEL,
+            contents=contents,  # type: ignore - SDK accepts list[Content]
+            config=cfg,
+        )
+
     # Run sync Gemini call in thread to avoid blocking async event loop
-    resp = await asyncio.to_thread(
-        client.models.generate_content,
-        model=UI_MODEL,
-        contents=contents,  # type: ignore - SDK accepts list[Content]
-        config=cfg,
-    )
+    resp = await asyncio.to_thread(_run_plan)
     
     if not resp.candidates:
         return {"error": "Gemini returned no candidates"}
@@ -701,6 +774,8 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
     parts = candidate.content.parts
     text = "".join(p.text for p in parts if p.text)
     result = _extract_json_object(text)
+    if not isinstance(result, dict):
+        return {"error": "unable_to_plan"}
     
     # Store clickable elements in result for click handler to use
     result['_clickable_elements'] = clickable_elements
@@ -726,7 +801,7 @@ async def ws_ui(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    gen_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+    gen_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location=location)
 
     session_id = int(time.time())
     await websocket.send_json({"type": "status", "status": "connected", "session_id": session_id, "model": UI_MODEL})
@@ -1045,12 +1120,30 @@ async def ws_story(websocket: WebSocket) -> None:
         return
 
     session_id = int(time.time())
-    cancel_flag = False
+    context = {
+        "cancel_flag": False,
+        "active_task": None,
+        "state": "connected",
+    }
+    send_lock = asyncio.Lock()
 
     async def send(payload: dict) -> None:
         payload.setdefault("session_id", session_id)
         try:
-            await websocket.send_json(payload)
+            async with send_lock:
+                await websocket.send_json(payload)
+        except Exception:
+            pass
+
+    async def send_interrupt_ack(source: str = "client") -> None:
+        payload = {
+            "type": "interrupted",
+            "source": source,
+            "session_id": session_id,
+        }
+        try:
+            async with send_lock:
+                await websocket.send_json(payload)
         except Exception:
             pass
 
@@ -1060,12 +1153,14 @@ async def ws_story(websocket: WebSocket) -> None:
         text = (text or "").strip()
         if not text or len(text) < 3:
             return None
+        if context["cancel_flag"]:
+            return None
         try:
-            client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            client = _make_genai_client(role="executor", prefer_vertex=True, project=project, location=location)
             
             # Use async Live API with system instruction to just read text aloud
             async with client.aio.live.connect(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash-exp",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     system_instruction="You are a professional narrator. Your only job is to read the provided text aloud exactly as written, with expression and emotion. Do not respond, comment, or add anything. Just narrate the text word-for-word.",
@@ -1091,11 +1186,20 @@ async def ws_story(websocket: WebSocket) -> None:
                 # Collect audio chunks
                 audio_chunks = []
                 async for response in session.receive():
+                    if context["cancel_flag"]:
+                        close_session = getattr(session, "close", None)
+                        if callable(close_session):
+                            maybe_close = close_session()
+                            if inspect.isawaitable(maybe_close):
+                                await maybe_close
+                        break
                     if response.data:
                         audio_chunks.append(response.data)
                     if response.server_content and response.server_content.turn_complete:
                         break
                 
+                if context["cancel_flag"]:
+                    return None
                 if audio_chunks:
                     # Concatenate all PCM16 chunks
                     return b"".join(audio_chunks)
@@ -1137,139 +1241,253 @@ async def ws_story(websocket: WebSocket) -> None:
             print(f"[STORY IMAGE] Error generating image: {e}", file=sys.stderr)
             return None
 
-    await send({"type": "status", "status": "connected", "model": "gemini-2.5-flash-image"})
+    # Default image model: prefer Gemini 3.1 Flash Image. Can be overridden via AERIVON_VERTEX_IMAGE_MODEL.
+    story_model_name = (os.getenv("AERIVON_VERTEX_IMAGE_MODEL") or "gemini-3.1-flash-image").strip()
 
-    try:
+    async def send_audio_chunked(audio_bytes: bytes, *, index: int) -> None:
+        if not audio_bytes:
+            return
+        chunk_size = WS_AUDIO_CHUNK_BYTES
+        total_parts = max(1, (len(audio_bytes) + chunk_size - 1) // chunk_size)
+        for part_index in range(total_parts):
+            if context["cancel_flag"]:
+                return
+            start = part_index * chunk_size
+            end = start + chunk_size
+            await send({
+                "type": "audio",
+                "data_b64": base64.b64encode(audio_bytes[start:end]).decode("ascii"),
+                "mime_type": "audio/pcm;rate=24000",
+                "sample_rate": 24000,
+                "index": index,
+                "chunk_index": part_index,
+                "chunk_total": total_parts,
+            })
+            await asyncio.sleep(0)
+
+    await send({"type": "status", "status": "connected", "model": story_model_name})
+
+    async def run_story_flow(prompt: str) -> None:
+        if context["cancel_flag"]:
+            raise asyncio.CancelledError()
+
+        story_prompt = (
+            "You are a creative storyteller and visual artist. "
+            "Create an immersive, illustrated story based on the user's prompt. "
+            "For each scene in the story:\n"
+            "1. Write 2-3 sentences of vivid narration\n"
+            "2. Generate an illustration for that scene in a beautiful storybook art style\n"
+            "Alternate between narration and images throughout. "
+            "Make the story engaging, emotional, and visually rich. "
+            "Do not claim you cannot browse or access websites; the system already provides needed context.\n\n"
+            f"Story prompt: {prompt}"
+        )
+
+        gen_client = _make_genai_client(
+            role="executor",
+            prefer_vertex=True,
+            project=project,
+            location="global",
+        )
+
+        @retry_with_exponential_backoff
+        def _run_story() -> tuple[list[dict], str]:
+            """Run generate_content in thread, return list of parts as dicts."""
+            print("[STORY DEBUG] Calling Gemini with multimodal image-capable model", file=sys.stderr)
+            try:
+                resp = gen_client.models.generate_content(
+                    model=story_model_name,
+                    contents=story_prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                        temperature=0.7,
+                        max_output_tokens=4096,
+                    ),
+                )
+                print("[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
+            except Exception as gemini_error:
+                print(f"[STORY ERROR] Gemini API call failed: {type(gemini_error).__name__}: {gemini_error}", file=sys.stderr)
+                raise
+
+            parts = []
+            model_used = str(getattr(resp, "model", "") or story_model_name)
+            if resp.candidates:
+                for candidate in resp.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if part.text:
+                                parts.append({"kind": "text", "text": part.text})
+                            elif part.inline_data and part.inline_data.data:
+                                parts.append({
+                                    "kind": "image",
+                                    "data": base64.b64encode(part.inline_data.data).decode("ascii"),
+                                    "mime_type": part.inline_data.mime_type,
+                                })
+
+            print(f"[STORY DEBUG] Extracted {len(parts)} parts from response", file=sys.stderr)
+            return parts, model_used
+
+        if context["cancel_flag"]:
+            raise asyncio.CancelledError()
+        async with STORY_SEMAPHORE:
+            if context["cancel_flag"]:
+                raise asyncio.CancelledError()
+            parts, model_used = await asyncio.to_thread(_run_story)
+
+        if context["cancel_flag"]:
+            raise asyncio.CancelledError()
+        await asyncio.sleep(0)
+        if context["cancel_flag"]:
+            raise asyncio.CancelledError()
+        await send({"type": "debug", "model": model_used})
+        await asyncio.sleep(0)
+
+        pending_text = ""
+        image_index = 0
+        for idx, part in enumerate(parts):
+            if context["cancel_flag"]:
+                raise asyncio.CancelledError()
+
+            if part["kind"] == "text":
+                text = part["text"]
+                pending_text += text
+                if context["cancel_flag"]:
+                    raise asyncio.CancelledError()
+                await send({"type": "text", "text": text, "index": idx})
+                await asyncio.sleep(0)
+
+            elif part["kind"] == "image":
+                if context["cancel_flag"]:
+                    raise asyncio.CancelledError()
+                if pending_text.strip():
+                    if context["cancel_flag"]:
+                        raise asyncio.CancelledError()
+                    await asyncio.sleep(0)
+                    try:
+                        audio_bytes = await asyncio.wait_for(live_narrate(pending_text), timeout=20)
+                    except asyncio.TimeoutError:
+                        print("[STORY NARRATION] Timeout during narration chunk", file=sys.stderr)
+                        audio_bytes = None
+                    if context["cancel_flag"]:
+                        raise asyncio.CancelledError()
+                    if audio_bytes:
+                        await send_audio_chunked(audio_bytes, index=idx)
+                    pending_text = ""
+
+                if context["cancel_flag"]:
+                    raise asyncio.CancelledError()
+                await send({
+                    "type": "image",
+                    "data_b64": part["data"],
+                    "mime_type": part["mime_type"],
+                    "index": image_index,
+                })
+                image_index += 1
+                await asyncio.sleep(0)
+
+        if pending_text.strip():
+            if context["cancel_flag"]:
+                raise asyncio.CancelledError()
+            await asyncio.sleep(0)
+            try:
+                audio_bytes = await asyncio.wait_for(live_narrate(pending_text), timeout=20)
+            except asyncio.TimeoutError:
+                print("[STORY NARRATION] Timeout during trailing narration", file=sys.stderr)
+                audio_bytes = None
+            if context["cancel_flag"]:
+                raise asyncio.CancelledError()
+            if audio_bytes:
+                await send_audio_chunked(audio_bytes, index=9999)
+
+        if context["cancel_flag"]:
+            raise asyncio.CancelledError()
+        await send({"type": "status", "status": "done"})
+        await send({"type": "done"})
+
+    message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def message_listener() -> None:
+        try:
+            while True:
+                data = await websocket.receive_json()
+                if not isinstance(data, dict):
+                    continue
+
+                msg_type = str(data.get("type") or "").strip().lower()
+
+                if msg_type == "interrupt":
+                    await send_interrupt_ack("client")
+
+                    context["cancel_flag"] = True
+                    context["state"] = "connected"
+
+                    task = context.get("active_task")
+                    if task and not task.done():
+                        task.cancel()
+
+                    await send({"type": "status", "status": "connected"})
+                    continue
+
+                await message_queue.put(data)
+        except WebSocketDisconnect:
+            await message_queue.put(None)
+        except Exception as exc:
+            try:
+                await send({"type": "error", "error": str(exc)})
+            except Exception:
+                pass
+            await message_queue.put(None)
+
+    async def main_processor() -> None:
         while True:
-            msg = await websocket.receive_json()
-            if not isinstance(msg, dict):
-                continue
+            data = await message_queue.get()
+            if data is None:
+                return
 
-            msg_type = str(msg.get("type") or "").strip().lower()
-
-            if msg_type == "interrupt":
-                cancel_flag = True
-                await send({"type": "status", "status": "interrupted"})
-                cancel_flag = False
-                continue
-
+            msg_type = str(data.get("type") or "").strip().lower()
             if msg_type != "prompt":
                 continue
 
-            prompt = str(msg.get("text") or "").strip()
+            prompt = str(data.get("text") or "").strip()
             if not prompt:
                 await send({"type": "error", "error": "missing prompt text"})
                 continue
 
-            cancel_flag = False
-            await send({"type": "status", "status": "generating"})
+            async def run_prompt() -> None:
+                context["cancel_flag"] = False
+                context["state"] = "generating"
+                await send({"type": "status", "status": "generating"})
+                await run_story_flow(prompt)
 
-            # Build the story prompt that instructs Gemini to interleave text + images
-            story_prompt = (
-                "You are a creative storyteller and visual artist. "
-                "Create an immersive, illustrated story based on the user's prompt. "
-                "For each scene in the story:\n"
-                "1. Write 2-3 sentences of vivid narration\n"
-                "2. Generate an illustration for that scene in a beautiful storybook art style\n"
-                "Alternate between narration and images throughout. "
-                "Make the story engaging, emotional, and visually rich.\n\n"
-                f"Story prompt: {prompt}"
-            )
+            task = asyncio.create_task(run_prompt())
+            context["active_task"] = task
 
             try:
-                gen_client = _make_genai_client(
-                    prefer_vertex=True, project=project, location="global"
-                )
-
-                @retry_with_exponential_backoff
-                def _run_story() -> list[dict]:
-                    """Run generate_content in thread, return list of parts as dicts."""
-                    print("[STORY DEBUG] Calling Gemini with model: gemini-2.5-flash-image", file=sys.stderr)
-                    try:
-                        resp = gen_client.models.generate_content(
-                            model="gemini-2.5-flash-image",
-                            contents=story_prompt,
-                            config=types.GenerateContentConfig(
-                                response_modalities=["TEXT", "IMAGE"],
-                                temperature=0.9,
-                                max_output_tokens=4096,
-                            ),
-                        )
-                        print("[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
-                    except Exception as gemini_error:
-                        print(f"[STORY ERROR] Gemini API call failed: {type(gemini_error).__name__}: {gemini_error}", file=sys.stderr)
-                        raise
-                    
-                    # Extract parts from multimodal response
-                    parts = []
-                    if resp.candidates:
-                        for candidate in resp.candidates:
-                            if candidate.content and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    if part.text:
-                                        parts.append({"kind": "text", "text": part.text})
-                                    elif part.inline_data and part.inline_data.data:
-                                        parts.append({
-                                            "kind": "image",
-                                            "data": base64.b64encode(part.inline_data.data).decode("ascii"),
-                                            "mime_type": part.inline_data.mime_type,
-                                        })
-                    
-                    print(f"[STORY DEBUG] Extracted {len(parts)} parts from response", file=sys.stderr)
-                    return parts
-
-                parts = await asyncio.to_thread(_run_story)
-
-                # Stream parts to client with TTS for text chunks
-                pending_text = ""
-                for idx, part in enumerate(parts):
-                    if cancel_flag:
-                        break
-
-                    if part["kind"] == "text":
-                        text = part["text"]
-                        pending_text += text
-                        await send({"type": "text", "text": text, "index": idx})
-
-                    elif part["kind"] == "image":
-                        # Narrate accumulated text before this image using Gemini Live
-                        if pending_text.strip():
-                            audio_bytes = await live_narrate(pending_text)
-                            if audio_bytes:
-                                await send({
-                                    "type": "audio",
-                                    "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                                    "mime_type": "audio/pcm;rate=24000",
-                                    "sample_rate": 24000,
-                                    "index": idx,
-                                })
-                            pending_text = ""
-
-                        await send({
-                            "type": "image",
-                            "data_b64": part["data"],
-                            "mime_type": part["mime_type"],
-                            "index": idx,
-                        })
-
-                # Narrate any trailing text after last image
-                if pending_text.strip() and not cancel_flag:
-                    audio_bytes = await live_narrate(pending_text)
-                    if audio_bytes:
-                        await send({
-                            "type": "audio",
-                            "data_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                            "mime_type": "audio/pcm;rate=24000",
-                            "sample_rate": 24000,
-                            "index": 9999,
-                        })
-
-                await send({"type": "status", "status": "done"})
+                await asyncio.wait_for(task, timeout=180)
+            except asyncio.TimeoutError:
+                context["cancel_flag"] = True
+                task.cancel()
+                await send({"type": "error", "error": "timeout"})
                 await send({"type": "done"})
-
+                context["cancel_flag"] = False
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 await send({"type": "error", "error": str(e)})
+                await send({"type": "done"})
+                context["cancel_flag"] = False
+            finally:
+                if context.get("active_task") is task:
+                    context["active_task"] = None
+                context["state"] = "connected"
 
+    listener_task: asyncio.Task | None = None
+    processor_task: asyncio.Task | None = None
+
+    try:
+        listener_task = asyncio.create_task(message_listener())
+        processor_task = asyncio.create_task(main_processor())
+        await asyncio.gather(listener_task, processor_task)
     except WebSocketDisconnect:
         return
     except Exception as exc:
@@ -1277,6 +1495,10 @@ async def ws_story(websocket: WebSocket) -> None:
             await send({"type": "error", "error": str(exc)})
         except Exception:
             pass
+    finally:
+        for task in (listener_task, processor_task):
+            if task is not None and not task.done():
+                task.cancel()
 
 
 class AgentMessageRequest(BaseModel):
@@ -1313,6 +1535,15 @@ async def health() -> dict[str, Any]:
         "status": "ok" if status["live_models_available"] else "live_model_unavailable",
         "project": project,
         "location": location,
+    }
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {
+        "service": "aerivon-live-agent",
+        "status": "ok",
+        "endpoints": ["/health", "/ws/aerivon", "/ws/live", "/ws/ui", "/ws/story"],
     }
 
 
@@ -1470,11 +1701,11 @@ async def post_agent_speak(payload: SpeakRequest) -> StreamingResponse:
     async def _narrate_live() -> bytes:
         """Use Gemini Live API to generate speech."""
         try:
-            client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+            client = _make_genai_client(role="chat", prefer_vertex=True, project=project, location=location)
             
             # Create Live session for speech synthesis (async only)
             async with client.aio.live.connect(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash-exp",
                 config=types.LiveConnectConfig(
                     response_modalities=[types.Modality.AUDIO],
                     speech_config=types.SpeechConfig(
@@ -1610,11 +1841,11 @@ async def ws_live(websocket: WebSocket) -> None:
         user_memory = await _load_user_memory(user_id=memory_user_id)
         memory_prompt = _memory_to_prompt(user_memory)
 
-    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.5-flash").strip()
+    model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-1.5-flash").strip()
 
     try:
         # Live API requires API key (not supported in Vertex AI)
-        client = _make_genai_client(prefer_vertex=False, project=project, location=location)
+        client = _make_genai_client(role="chat", prefer_vertex=False, project=project, location=location)
     except Exception as exc:
         await websocket.send_json({"type": "error", "error": str(exc)})
         await websocket.close(code=1011)
@@ -1739,7 +1970,7 @@ async def ws_live(websocket: WebSocket) -> None:
         # Pick a standard model. If there's no Vertex project, skip model listing.
         preferred = os.getenv(
             "AERIVON_WS_FALLBACK_MODEL",
-            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"),
+            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-pro"),
         )
         fallback_model = resolve_fallback_model(project, location, preferred) if project else preferred
 
@@ -2299,12 +2530,14 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             for line in tb.format_stack():
                 f.write(line)
             f.write(f"{'='*80}\n")
-    except:
+    except Exception:
         pass
     
     # ============ STEP 1: CONFIRM HANDLER FUNCTION ============
+    _frame = inspect.currentframe()
+    _func_name = _frame.f_code.co_name if _frame else "unknown"
     print(f"\n{'='*80}", file=sys.stderr)
-    print(f"AERIVON_WS_ENTRY {__file__} PID {os.getpid()} FUNC {inspect.currentframe().f_code.co_name}", file=sys.stderr)
+    print(f"AERIVON_WS_ENTRY {__file__} PID {os.getpid()} FUNC {_func_name}", file=sys.stderr)
     print(f"{'='*80}\n", file=sys.stderr)
     sys.stderr.flush()
     
@@ -2324,15 +2557,9 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
     print("[AERIVON] 🎯 WebSocket ACCEPTED", file=sys.stderr)
     sys.stderr.flush()
     
-    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
     project = os.getenv("GOOGLE_CLOUD_PROJECT")
     location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-    if not use_vertex or not project:
-        await websocket.send_json({"type": "error", "error": "Vertex AI not enabled"})
-        await websocket.close(code=1011)
-        return
-
-    gen_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
+    
     session_id = int(time.time())
     
     # Session state
@@ -2343,14 +2570,57 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         "state": "IDLE",
         "last_user_text": "",
         "conversation_history": [],
-        "current_mode": None,
+        "engine_mode": None,
         "active_task": None,
         "audio_mode": False,  # Track if user is using voice input
         "pw": None,
         "browser": None,
         "browser_context": None,
         "page": None,
+        "barge_in_pending": False,
+        "suppress_cancel_notice": False,
+        "last_assistant_text": "",
+        "ignore_audio_until": 0.0,
+        "execution_lock": False,
     }
+
+    ECHO_SUPPRESS_SECONDS = float(os.getenv("AERIVON_ECHO_SUPPRESS_SECONDS", "1.4"))
+
+    def _mark_echo_suppression_window(*, audio_bytes: int = 0) -> None:
+        base = ECHO_SUPPRESS_SECONDS
+        # 24kHz, 16-bit mono => 48000 bytes/sec
+        derived = (audio_bytes / 48000.0) * 0.8 if audio_bytes > 0 else 0.0
+        duration = max(base, min(3.5, derived))
+        context["ignore_audio_until"] = max(float(context.get("ignore_audio_until") or 0.0), time.time() + duration)
+
+    def _validate_execution_output(response_text: str) -> None:
+        lowered = (response_text or "").lower()
+        if any(marker in lowered for marker in EXECUTION_DRIFT_MARKERS):
+            raise RuntimeError("Execution drift detected")
+
+    async def _send_audio_chunked(audio_bytes: bytes, *, index: int | None = None) -> None:
+        if not audio_bytes:
+            return
+        _mark_echo_suppression_window(audio_bytes=len(audio_bytes))
+        chunk_size = WS_AUDIO_CHUNK_BYTES
+        total_parts = max(1, (len(audio_bytes) + chunk_size - 1) // chunk_size)
+        for part_index in range(total_parts):
+            if context["cancel_flag"]:
+                return
+            start = part_index * chunk_size
+            end = start + chunk_size
+            payload = {
+                "type": "audio",
+                "data_b64": base64.b64encode(audio_bytes[start:end]).decode("ascii"),
+                "mime_type": "audio/pcm;rate=24000",
+                "sample_rate": 24000,
+                "chunk_index": part_index,
+                "chunk_total": total_parts,
+            }
+            if index is not None:
+                payload["index"] = index
+            await websocket.send_json(payload)
+            await asyncio.sleep(0)
     
     # Helper function for narration (shared across story and UI handlers)
     async def narrate_and_send(text: str) -> None:
@@ -2362,60 +2632,73 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         
         print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
         try:
-            # Live API requires API key (not supported in Vertex AI)
-            narrate_client = _make_genai_client(prefer_vertex=False, project=project, location=location)
-            
-            async with narrate_client.aio.live.connect(
-                model="gemini-2.0-flash-exp",
-                config=types.LiveConnectConfig(
-                    response_modalities=[types.Modality.AUDIO],
-                    system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name="Aoede"
-                            )
-                        )
-                    ),
-                ),
-            ) as session:
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
-                    ),
-                    turn_complete=True
+            def _is_api_key_live_error(exc: Exception) -> bool:
+                msg = str(exc)
+                return (
+                    "API keys are not supported" in msg
+                    or "1008" in msg
+                    or "1007" in msg
+                    or "Invalid resource field value" in msg
+                    or "UNAUTHENTICATED" in msg
                 )
-                
-                audio_chunks = []
-                async for response in session.receive():
-                    # Cooperative cancellation check
-                    if context["cancel_flag"]:
-                        print(f"[AERIVON NARRATION] Cancelled during audio streaming", file=sys.stderr)
-                        raise asyncio.CancelledError()
-                    
-                    if response.data:
-                        audio_chunks.append(response.data)
-                        print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
-                    if response.server_content and response.server_content.turn_complete:
-                        break
-                
-                if audio_chunks:
-                    total_bytes = b"".join(audio_chunks)
-                    print(f"[AERIVON NARRATION] ✅ Generated {len(total_bytes)} bytes of audio", file=sys.stderr)
-                    
-                    # Send audio to client
-                    await websocket.send_json({
-                        "type": "audio",
-                        "data_b64": base64.b64encode(total_bytes).decode("ascii"),
-                        "mime_type": "audio/pcm",
-                        "sample_rate": 24000
-                    })
-                else:
-                    print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
+
+            async def _run_narration_session(live_client: genai.Client, model_name: str) -> list[bytes]:
+                async with live_client.aio.live.connect(
+                    model=model_name,
+                    config=types.LiveConnectConfig(
+                        response_modalities=[types.Modality.AUDIO],
+                        system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name="Aoede"
+                                )
+                            )
+                        ),
+                    ),
+                ) as session:
+                    await session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
+                        ),
+                        turn_complete=True
+                    )
+
+                    audio_chunks_local: list[bytes] = []
+                    async for response in session.receive():
+                        if context["cancel_flag"]:
+                            print("[AERIVON NARRATION] Cancelled during audio streaming", file=sys.stderr)
+                            raise asyncio.CancelledError()
+                        if response.data:
+                            audio_chunks_local.append(response.data)
+                            print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
+                        if response.server_content and response.server_content.turn_complete:
+                            break
+                    return audio_chunks_local
+
+            narration_model = (os.getenv("AERIVON_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+            narrate_client = _make_genai_client(role="chat", prefer_vertex=False, project=project, location=location)
+
+            try:
+                audio_chunks = await _run_narration_session(narrate_client, narration_model)
+            except Exception as exc:
+                if not (_is_api_key_live_error(exc) and project):
+                    raise
+                print(f"[AERIVON NARRATION] API key Live rejected, retrying with Vertex OAuth: {exc}", file=sys.stderr)
+                vertex_client = _make_genai_client(role="chat", prefer_vertex=True, project=project, location=location)
+                vertex_live_model = (os.getenv("AERIVON_VERTEX_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+                audio_chunks = await _run_narration_session(vertex_client, vertex_live_model)
+
+            if audio_chunks:
+                total_bytes = b"".join(audio_chunks)
+                print(f"[AERIVON NARRATION] ✅ Generated {len(total_bytes)} bytes of audio", file=sys.stderr)
+                await _send_audio_chunked(total_bytes)
+            else:
+                print("[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
                     
         except asyncio.CancelledError:
-            print(f"[AERIVON NARRATION] Task cancelled cleanly", file=sys.stderr)
+            print("[AERIVON NARRATION] Task cancelled cleanly", file=sys.stderr)
             raise  # Re-raise so run_with_cancel handler catches it
         except Exception as e:
             print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
@@ -2463,6 +2746,24 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 "intent": "live",
                 "confidence": 0.90,
                 "reason": "Memory recall question detected",
+                "requires_audio": False,
+                "requires_browser": False,
+                "requires_images": False
+            }
+
+        confirmation_patterns = [
+            "okay, i can",
+            "okay, i will",
+            "is there anything else",
+            "what would you like",
+            "can i help you with"
+        ]
+
+        if any(p in text for p in confirmation_patterns):
+            return {
+                "intent": "live",
+                "confidence": 0.85,
+                "reason": "Assistant-style confirmation detected",
                 "requires_audio": False,
                 "requires_browser": False,
                 "requires_images": False
@@ -2547,14 +2848,22 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             context["audio_mode"] = False
         
         context["last_user_text"] = text
+        context["cancel_flag"] = False
         context["state"] = "THINKING"
         
         await websocket.send_json({"type": "status", "state": "THINKING"})
         await websocket.send_json({"type": "thinking", "text": "Understanding your request..."})
+
+        if context.get("execution_lock"):
+            await websocket.send_json({
+                "type": "error",
+                "error": "Execution in progress. Send interrupt to cancel current execution first."
+            })
+            return
         
         # Detect intent
         intent_result = await detect_intent({"type": "text", "text": text})
-        context["current_mode"] = intent_result["intent"]
+        context["engine_mode"] = intent_result["intent"]
         
         # Send intent to frontend
         await websocket.send_json({
@@ -2566,234 +2875,213 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         
         # Route based on intent with cancellation support
         try:
-            if intent_result["intent"] == "story":
-                await run_with_cancel(handle_story_request(text))
-            elif intent_result["intent"] == "ui":
-                await run_with_cancel(handle_ui_request(text))
-            elif intent_result["intent"] == "hybrid":
-                await run_with_cancel(handle_hybrid_request(text))
-            else:  # live/conversational
+            if context["engine_mode"] == "live":
                 await run_with_cancel(handle_conversational(text))
+            elif context["engine_mode"] == "ui":
+                await run_with_cancel(handle_ui_request(text))
+            elif context["engine_mode"] == "story":
+                await handle_story_request(text)
+            elif context["engine_mode"] == "hybrid":
+                await run_with_cancel(handle_hybrid_request(text))
+            else:
+                await websocket.send_json({"type": "error", "error": "Unknown engine mode"})
         except asyncio.CancelledError:
-            await websocket.send_json({"type": "text", "text": "⚠️ Task cancelled"})
+            if not context.get("suppress_cancel_notice"):
+                await websocket.send_json({"type": "text", "text": "⚠️ Task cancelled"})
+            context["suppress_cancel_notice"] = False
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
-            raise
+            return
     
     async def handle_story_request(prompt: str):
         """Handle story generation requests."""
+        context["execution_lock"] = True
+        context["engine_mode"] = "story"
         context["state"] = "GENERATING"
         await websocket.send_json({"type": "status", "state": "GENERATING"})
         await websocket.send_json({"type": "thinking", "text": "Creating an illustrated story..."})
         
-        try:
-            # Build story prompt with conversation context if available
-            story_context = ""
-            if context["conversation_history"]:
-                # Include recent context for story continuity
-                recent_msgs = []
-                for ex in context["conversation_history"][-3:]:
-                    user_msg = ex.get("user", "")
-                    if user_msg:
-                        recent_msgs.append(f"User mentioned: {user_msg}")
-                if recent_msgs:
-                    story_context = "\n\nContext from conversation:\n" + "\n".join(recent_msgs)
-            
-            story_prompt = f"""Create an illustrated fantasy story based on this prompt:
-{prompt}{story_context}
+        story_task: asyncio.Task | None = None
 
-For each scene in the story:
-1. Write 2-3 sentences of vivid narration
-2. Then request an image that visualizes that scene
+        async def _send_audio_chunked(audio_bytes: bytes, *, index: int) -> None:
+            if not audio_bytes:
+                return
+            _mark_echo_suppression_window(audio_bytes=len(audio_bytes))
+            chunk_size = WS_AUDIO_CHUNK_BYTES
+            total_parts = max(1, (len(audio_bytes) + chunk_size - 1) // chunk_size)
+            for part_index in range(total_parts):
+                if context["cancel_flag"]:
+                    return
+                start = part_index * chunk_size
+                end = start + chunk_size
+                chunk = audio_bytes[start:end]
+                await websocket.send_json({
+                    "type": "audio",
+                    "data_b64": base64.b64encode(chunk).decode("ascii"),
+                    "mime_type": "audio/pcm;rate=24000",
+                    "sample_rate": 24000,
+                    "index": index,
+                    "chunk_index": part_index,
+                    "chunk_total": total_parts,
+                })
+                await asyncio.sleep(0)
 
-Keep the story to exactly 2 scenes. Do not label scenes as "Scene 1" or "Scene 2".
-Make it engaging and visual."""
-            
-            # Use Gemini API client for story generation
-            story_gen_client = _make_genai_client(
-                prefer_vertex=True, project=project, location="global"
+        async def narrate_text(text: str) -> bytes | None:
+            if context["cancel_flag"]:
+                return None
+            text = (text or "").strip()
+            if not text or len(text) < 3:
+                return None
+            try:
+                narrate_client = _make_genai_client(role="executor", prefer_vertex=True, project=project, location=location)
+                async with narrate_client.aio.live.connect(
+                    model="gemini-2.0-flash-exp",
+                    config=types.LiveConnectConfig(
+                        response_modalities=[types.Modality.AUDIO],
+                        system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+                            )
+                        ),
+                    ),
+                ) as session:
+                    await session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")],
+                        ),
+                        turn_complete=True,
+                    )
+                    audio_chunks: list[bytes] = []
+                    async for response in session.receive():
+                        if context["cancel_flag"]:
+                            raise asyncio.CancelledError()
+                        if response.data:
+                            audio_chunks.append(response.data)
+                        if response.server_content and response.server_content.turn_complete:
+                            break
+                    return b"".join(audio_chunks) if audio_chunks else None
+            except asyncio.CancelledError:
+                return None
+            except Exception as e:
+                print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
+                return None
+
+        async def _story_worker(story_text: str) -> None:
+            story_prompt = (
+                f"{EXECUTION_SYSTEM_PROMPT}\n\n"
+                f"User request: {story_text}\n"
+                f"Required style default if unspecified: {DEFAULT_STYLE}."
             )
-            
+            story_model = (os.getenv("AERIVON_VERTEX_IMAGE_MODEL") or "gemini-2.5-flash-image").strip()
+            story_gen_client = _make_genai_client(role="executor", prefer_vertex=True, project=project, location="global")
+
             @retry_with_exponential_backoff
-            def _run_story() -> list[dict]:
-                """Run generate_content in thread, return list of parts as dicts."""
+            def _run_story() -> tuple[list[dict], str]:
                 resp = story_gen_client.models.generate_content(
-                    model="gemini-2.5-flash-image",
+                    model=story_model,
                     contents=story_prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
-                        temperature=0.9,
+                        temperature=0.7,
                         max_output_tokens=2000,
                     ),
                 )
-                
-                # Extract parts from multimodal response
-                parts = []
+                model_used = str(getattr(resp, "model", "") or story_model)
+                parts: list[dict] = []
+                response_text_parts: list[str] = []
                 if resp.candidates:
                     for candidate in resp.candidates:
                         if candidate.content and candidate.content.parts:
                             for part in candidate.content.parts:
                                 if part.text:
                                     parts.append({"kind": "text", "text": part.text})
+                                    response_text_parts.append(part.text)
                                 elif part.inline_data and part.inline_data.data:
                                     parts.append({
                                         "kind": "image",
                                         "data": base64.b64encode(part.inline_data.data).decode("ascii"),
                                         "mime_type": part.inline_data.mime_type,
                                     })
-                return parts
-            
-            # Run story generation in thread
-            parts = await asyncio.to_thread(_run_story)
-            
-            # Helper to narrate text using Gemini Live API
-            async def narrate_text(text: str) -> bytes | None:
-                """Generate speech audio for story narration."""
-                # Check cancel flag before narration
-                if context["cancel_flag"]:
-                    print(f"[AERIVON NARRATION] Cancelled before narration", file=sys.stderr)
-                    return None
-                
-                text = (text or "").strip()
-                if not text or len(text) < 3:
-                    print(f"[AERIVON NARRATION] Skipping empty/short text: '{text}'", file=sys.stderr)
-                    return None
-                
-                print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
-                try:
-                    narrate_client = _make_genai_client(prefer_vertex=True, project=project, location=location)
-                    
-                    async with narrate_client.aio.live.connect(
-                        model="gemini-2.0-flash-exp",
-                        config=types.LiveConnectConfig(
-                            response_modalities=[types.Modality.AUDIO],
-                            system_instruction="You are a professional narrator. Read the provided text aloud exactly as written, with expression and emotion.",
-                            speech_config=types.SpeechConfig(
-                                voice_config=types.VoiceConfig(
-                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                        voice_name="Aoede"  # Warm, storytelling voice
-                                    )
-                                )
-                            ),
-                        ),
-                    ) as session:
-                        await session.send_client_content(
-                            turns=types.Content(
-                                role="user",
-                                parts=[types.Part.from_text(text=f"Please read this text aloud:\n\n{text}")]
-                            ),
-                            turn_complete=True
-                        )
-                        
-                        audio_chunks = []
-                        async for response in session.receive():
-                            # Cooperative cancellation check
-                            if context["cancel_flag"]:
-                                print(f"[AERIVON NARRATION] Cancelled during audio streaming", file=sys.stderr)
-                                raise asyncio.CancelledError()
-                            
-                            if response.data:
-                                audio_chunks.append(response.data)
-                                print(f"[AERIVON NARRATION] Received audio chunk: {len(response.data)} bytes", file=sys.stderr)
-                            if response.server_content and response.server_content.turn_complete:
-                                break
-                        
-                        if audio_chunks:
-                            total_bytes = b"".join(audio_chunks)
-                            print(f"[AERIVON NARRATION] ✅ Generated {len(total_bytes)} bytes of audio", file=sys.stderr)
-                            return total_bytes
-                        else:
-                            print(f"[AERIVON NARRATION] ❌ No audio chunks received", file=sys.stderr)
-                            return None
-                        
-                except asyncio.CancelledError:
-                    print(f"[AERIVON NARRATION] Task cancelled cleanly", file=sys.stderr)
-                    return None  # Return None instead of re-raising, story loop will handle cancel_flag
-                except Exception as e:
-                    print(f"[AERIVON NARRATION] ❌ Error: {e}", file=sys.stderr)
-                    import traceback
-                    traceback.print_exc()
-                    return None
-            
-            # Stream parts to client with narration
+                _validate_execution_output("\n".join(response_text_parts))
+                return parts, model_used
+
+            parts, model_used = await asyncio.to_thread(_run_story)
+            await asyncio.sleep(0)
+            await websocket.send_json({"type": "debug", "model": model_used})
+            await asyncio.sleep(0)
+
             pending_text = ""
+            image_index = 0
             for idx, part in enumerate(parts):
                 if context["cancel_flag"]:
-                    break
-                
+                    return
                 if part["kind"] == "text":
-                    text = part["text"]
-                    pending_text += text
-                    await websocket.send_json({
-                        "type": "text",
-                        "text": text,
-                        "index": idx
-                    })
-                elif part["kind"] == "image":
-                    # Narrate accumulated text before showing image
-                    if pending_text.strip():
-                        print(f"[AERIVON NARRATION] About to narrate text before image: {len(pending_text)} chars", file=sys.stderr)
-                        audio_bytes = await narrate_text(pending_text)
-                        if audio_bytes:
-                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                            print(f"[AERIVON NARRATION] Sending {len(audio_bytes)} bytes ({len(b64_audio)} b64 chars) to client", file=sys.stderr)
-                            await websocket.send_json({
-                                "type": "audio",
-                                "data_b64": b64_audio,
-                                "mime_type": "audio/pcm;rate=24000",
-                                "sample_rate": 24000,
-                                "index": idx
-                            })
-                        else:
-                            print(f"[AERIVON NARRATION] No audio generated for text", file=sys.stderr)
-                        pending_text = ""
-                    
-                    await websocket.send_json({
-                        "type": "image",
-                        "data_b64": part["data"],
-                        "mime_type": part["mime_type"],
-                        "index": idx
-                    })
-            
-            # Narrate any trailing text
-            if pending_text.strip() and not context["cancel_flag"]:
-                print(f"[AERIVON NARRATION] About to narrate trailing text: {len(pending_text)} chars", file=sys.stderr)
-                audio_bytes = await narrate_text(pending_text)
-                if audio_bytes:
-                    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                    print(f"[AERIVON NARRATION] Sending trailing {len(audio_bytes)} bytes ({len(b64_audio)} b64 chars) to client", file=sys.stderr)
-                    await websocket.send_json({
-                        "type": "audio",
-                        "data_b64": b64_audio,
-                        "mime_type": "audio/pcm;rate=24000",
-                        "sample_rate": 24000,
-                        "index": 9999
-                    })
-            
-            # Save story generation to memory
-            if context["user_id"] and AERIVON_MEMORY_BUCKET:
-                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
-                story_summary = f"Generated illustrated story with {len(parts)} parts (text and images)"
-                await _append_exchange_to_memory(
-                    user_id=memory_user_id,
-                    user_text=prompt,
-                    model_text=story_summary
-                )
-                context["conversation_history"].append({
-                    "t": int(time.time()),
-                    "user": prompt,
-                    "model": story_summary
+                    pending_text += part["text"]
+                    await websocket.send_json({"type": "text", "text": part["text"], "index": idx})
+                    await asyncio.sleep(0)
+                    continue
+
+                if context["cancel_flag"]:
+                    return
+                if pending_text.strip():
+                    await asyncio.sleep(0)
+                    audio_bytes = await narrate_text(pending_text)
+                    if context["cancel_flag"]:
+                        return
+                    if audio_bytes:
+                        await _send_audio_chunked(audio_bytes, index=idx)
+                    pending_text = ""
+
+                if context["cancel_flag"]:
+                    return
+                await websocket.send_json({
+                    "type": "image",
+                    "data_b64": part["data"],
+                    "mime_type": part["mime_type"],
+                    "index": image_index,
                 })
-                print(f"[MEMORY] Saved story generation for user {context['user_id']}", file=sys.stderr)
-            
+                image_index += 1
+                await asyncio.sleep(0)
+
+            if context["cancel_flag"]:
+                return
+            if pending_text.strip():
+                await asyncio.sleep(0)
+                audio_bytes = await narrate_text(pending_text)
+                if context["cancel_flag"]:
+                    return
+                if audio_bytes:
+                    await _send_audio_chunked(audio_bytes, index=9999)
+
+        try:
+            async with STORY_SEMAPHORE:
+                story_task = asyncio.create_task(_story_worker(prompt))
+                context["active_task"] = story_task
+                await story_task
+
+            if context["cancel_flag"]:
+                context["state"] = "IDLE"
+                await websocket.send_json({"type": "status", "state": "IDLE"})
+                return
+
             context["state"] = "DONE"
             await websocket.send_json({"type": "status", "state": "DONE"})
             await websocket.send_json({"type": "done"})
-            
+        except asyncio.CancelledError:
+            context["state"] = "IDLE"
+            await websocket.send_json({"type": "status", "state": "IDLE"})
+            return
         except Exception as e:
             await websocket.send_json({"type": "error", "error": f"Story generation failed: {str(e)}"})
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
+        finally:
+            if story_task is not None and context.get("active_task") is story_task:
+                context["active_task"] = None
+            context["execution_lock"] = False
+            context["engine_mode"] = None
     
     async def ensure_browser():
         """Ensure browser is running and ready (reuse across requests)."""
@@ -2811,11 +3099,15 @@ Make it engaging and visual."""
     
     async def handle_ui_request(goal: str):
         """Handle UI navigation requests with Playwright browser automation."""
+        context["engine_mode"] = "ui"
         context["state"] = "NAVIGATING"
+        completion_note = "Task completed."
         await websocket.send_json({"type": "status", "state": "NAVIGATING"})
         await websocket.send_json({"type": "thinking", "text": f"Launching browser for: {goal}"})
         
         try:
+            ui_planner_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location="global")
+
             # Ensure browser is ready (reuse if already open)
             await ensure_browser()
             page = context["page"]
@@ -2948,6 +3240,7 @@ Make it engaging and visual."""
             
             # Run action planning if there's more to do than just opening the page
             if not is_simple_navigation:
+                completion_note = "Task completed."
                 await websocket.send_json({
                     "type": "text",
                     "text": f"🤖 Planning actions to: {goal}"
@@ -2958,6 +3251,7 @@ Make it engaging and visual."""
                     f"Current URL: {page.url}",
                     f"Page title: {page_title}"
                 ]
+                completion_note = "Task completed."
                 
                 # Run planning loop (limited to 3 steps for Command Center)
                 for step in range(3):
@@ -2967,7 +3261,7 @@ Make it engaging and visual."""
                     
                     # Get action plan from Gemini
                     plan = await _ui_plan_actions(
-                        client=gen_client,
+                        client=ui_planner_client,
                         screenshot_png=png,
                         task=goal,
                         memory=memory,
@@ -3083,22 +3377,6 @@ Make it engaging and visual."""
                         await narrate_and_send(completion_note)
                         break
             
-            # Save UI interaction to memory
-            if context["user_id"] and AERIVON_MEMORY_BUCKET:
-                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
-                completion_summary = f"Navigated to {page.url}. {completion_note if 'completion_note' in locals() else 'Task completed.'}"
-                await _append_exchange_to_memory(
-                    user_id=memory_user_id,
-                    user_text=goal,
-                    model_text=completion_summary
-                )
-                context["conversation_history"].append({
-                    "t": int(time.time()),
-                    "user": goal,
-                    "model": completion_summary
-                })
-                print(f"[MEMORY] Saved UI navigation for user {context['user_id']}", file=sys.stderr)
-            
             context["state"] = "DONE"
             await websocket.send_json({"type": "status", "state": "DONE"})
             await websocket.send_json({"type": "done"})
@@ -3115,15 +3393,23 @@ Make it engaging and visual."""
             })
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
+        finally:
+            context["engine_mode"] = None
     
     async def handle_hybrid_request(request: str):
         """Handle hybrid requests that combine UI navigation and story generation."""
+        context["execution_lock"] = True
+        context["engine_mode"] = "hybrid"
         await websocket.send_json({"type": "status", "state": "THINKING"})
         await websocket.send_json({"type": "thinking", "text": "Planning multi-step solution..."})
         
         try:
+            ui_planner_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location="global")
+
             # Use Gemini to extract navigation goals and story theme
-            extraction_prompt = f"""Analyze this user request and extract two components:
+            extraction_prompt = f"""{PLANNER_SYSTEM_PROMPT}
+
+Analyze this user request and extract two components:
 1. Navigation goal: What website to visit and what actions to take
 2. Story theme: What kind of illustrated story to create based on findings
 
@@ -3135,22 +3421,30 @@ Respond in JSON format:
   "story_theme": "theme for the illustrated story"
 }}"""
             
-            extraction_client = _make_genai_client(prefer_vertex=True, project=project, location="global")
+            extraction_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location="global")
+
+            @retry_with_exponential_backoff
             def _extract():
                 return extraction_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=(os.getenv("AERIVON_VERTEX_TEXT_MODEL") or "gemini-2.5-flash").strip(),
                     contents=extraction_prompt,
                     config=types.GenerateContentConfig(
-                        temperature=0.3,
+                        system_instruction=PLANNER_SYSTEM_PROMPT,
+                        temperature=0.2,
                         response_mime_type="application/json"
                     )
                 )
-            response = await asyncio.to_thread(_extract)
-            
-            import json
-            extracted = json.loads(response.text)
-            navigation_goal = extracted.get("navigation_goal", "")
-            story_theme = extracted.get("story_theme", "")
+            try:
+                response = await asyncio.to_thread(_extract)
+                
+                import json
+                extracted = json.loads((response.text or "{}"))
+                navigation_goal = extracted.get("navigation_goal", "")
+                story_theme = extracted.get("story_theme", "")
+                if not navigation_goal or not story_theme:
+                    raise RuntimeError("Missing extracted navigation_goal or story_theme")
+            except Exception as exc:
+                raise RuntimeError("Hybrid planning failed") from exc
             
             await websocket.send_json({
                 "type": "text",
@@ -3204,13 +3498,19 @@ Respond in JSON format:
                         if context["cancel_flag"]:
                             break
                         
-                        plan = await _ui_plan_actions(
-                            client=gen_client,
-                            screenshot_png=png,
-                            task=navigation_goal,
-                            memory=memory,
-                            page=page
-                        )
+                        try:
+                            plan = await _ui_plan_actions(
+                                client=ui_planner_client,
+                                screenshot_png=png,
+                                task=navigation_goal,
+                                memory=memory,
+                                page=page
+                            )
+                        except Exception as exc:
+                            raise RuntimeError("Hybrid planning failed") from exc
+
+                        if isinstance(plan, dict) and plan.get("error"):
+                            raise RuntimeError("Hybrid planning failed")
                         
                         actions = plan.get("actions") or []
                         clickable_elements = plan.get("_clickable_elements") or []
@@ -3252,11 +3552,8 @@ Respond in JSON format:
                     # Take first 500 chars as context
                     navigation_findings.append(f"Content sample: {page_text[:500]}")
                 
-            except Exception as e:
-                await websocket.send_json({
-                    "type": "text",
-                    "text": f"⚠️ Navigation completed with some issues: {str(e)}"
-                })
+            except Exception as exc:
+                raise RuntimeError(f"Hybrid navigation failed: {str(exc)}") from exc
             
             # Phase 2: Generate illustrated story
             await websocket.send_json({
@@ -3269,7 +3566,9 @@ Respond in JSON format:
             
             # Build story prompt with navigation findings
             findings_text = "\n".join(navigation_findings)
-            story_prompt = f"""Create an illustrated fantasy story based on these findings:
+            story_prompt = f"""{EXECUTION_SYSTEM_PROMPT}
+
+Create an illustrated fantasy story based on these findings:
 
 Theme: {story_theme}
 
@@ -3281,10 +3580,12 @@ For each scene in the story:
 2. Then request an image that visualizes that scene
 
 Keep the story to exactly 2 scenes. Do not label scenes as "Scene 1" or "Scene 2".
-Make it engaging and visual, incorporating elements from the gathered information."""
+Make it engaging and visual, incorporating elements from the gathered information.
+If no style is specified, use: {DEFAULT_STYLE}."""
             
             # Use Gemini for story generation
             story_gen_client = _make_genai_client(
+                role="executor",
                 prefer_vertex=True, project=project, location="global"
             )
             
@@ -3292,29 +3593,32 @@ Make it engaging and visual, incorporating elements from the gathered informatio
             def _run_story() -> list[dict]:
                 """Run generate_content in thread, return list of parts as dicts."""
                 resp = story_gen_client.models.generate_content(
-                    model="gemini-2.5-flash-image",
+                    model=(os.getenv("AERIVON_VERTEX_IMAGE_MODEL") or "gemini-2.5-flash-image").strip(),
                     contents=story_prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
-                        temperature=0.9,
+                        temperature=0.7,
                         max_output_tokens=2000,
                     ),
                 )
                 
                 # Extract parts from multimodal response
                 parts = []
+                response_text_parts = []
                 if resp.candidates:
                     for candidate in resp.candidates:
                         if candidate.content and candidate.content.parts:
                             for part in candidate.content.parts:
                                 if part.text:
                                     parts.append({"kind": "text", "text": part.text})
+                                    response_text_parts.append(part.text)
                                 elif part.inline_data and part.inline_data.data:
                                     parts.append({
                                         "kind": "image",
                                         "data": base64.b64encode(part.inline_data.data).decode("ascii"),
                                         "mime_type": part.inline_data.mime_type,
                                     })
+                _validate_execution_output("\n".join(response_text_parts))
                 return parts
             
             # Run story generation in thread
@@ -3333,7 +3637,7 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                 print(f"[AERIVON NARRATION] Starting narration for {len(text)} chars", file=sys.stderr)
                 try:
                     # Use API key for narration (Live API not available in Vertex AI)
-                    narrate_client = _make_genai_client(prefer_vertex=False, project=project, location=location)
+                    narrate_client = _make_genai_client(role="executor", prefer_vertex=False, project=project, location=location)
                     
                     async with narrate_client.aio.live.connect(
                         model="gemini-2.0-flash-exp",
@@ -3379,6 +3683,7 @@ Make it engaging and visual, incorporating elements from the gathered informatio
             
             # Stream parts to client with narration
             pending_text = ""
+            image_index = 0
             for idx, part in enumerate(parts):
                 if context["cancel_flag"]:
                     break
@@ -3396,50 +3701,22 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                     if pending_text.strip():
                         audio_bytes = await narrate_text(pending_text)
                         if audio_bytes:
-                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                            await websocket.send_json({
-                                "type": "audio",
-                                "data_b64": b64_audio,
-                                "mime_type": "audio/pcm;rate=24000",
-                                "sample_rate": 24000,
-                                "index": idx
-                            })
+                            await _send_audio_chunked(audio_bytes, index=idx)
                         pending_text = ""
                     
                     await websocket.send_json({
                         "type": "image",
                         "data_b64": part["data"],
                         "mime_type": part["mime_type"],
-                        "index": idx
+                        "index": image_index
                     })
+                    image_index += 1
             
             # Narrate any remaining text
             if pending_text.strip():
                 audio_bytes = await narrate_text(pending_text)
                 if audio_bytes:
-                    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                    await websocket.send_json({
-                        "type": "audio",
-                        "data_b64": b64_audio,
-                        "mime_type": "audio/pcm;rate=24000",
-                        "sample_rate": 24000,
-                        "index": len(parts)
-                    })
-            
-            # Save hybrid interaction to memory
-            if context["user_id"] and AERIVON_MEMORY_BUCKET:
-                memory_user_id = _memory_user_key(user_id=context["user_id"], scope=context["memory_scope"])
-                summary = f"Navigated to gather information, then created illustrated story: {story_theme}"
-                await _append_exchange_to_memory(
-                    user_id=memory_user_id,
-                    user_text=request,
-                    model_text=summary
-                )
-                context["conversation_history"].append({
-                    "t": int(time.time()),
-                    "user": request,
-                    "model": summary
-                })
+                    await _send_audio_chunked(audio_bytes, index=len(parts))
             
             context["state"] = "DONE"
             await websocket.send_json({"type": "status", "state": "DONE"})
@@ -3457,15 +3734,19 @@ Make it engaging and visual, incorporating elements from the gathered informatio
             })
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
+        finally:
+            context["execution_lock"] = False
+            context["engine_mode"] = None
     
     async def handle_conversational(text: str):
         """Handle general conversational requests."""
+        context["engine_mode"] = "live"
         context["state"] = "THINKING"
         await websocket.send_json({"type": "status", "state": "THINKING"})
         
         try:
             # Build conversation context from memory
-            system_instruction = "You are Aerivon Live. Be concise and helpful."
+            system_instruction = CHAT_SYSTEM_PROMPT
             
             # Add conversation history if available
             if context["conversation_history"]:
@@ -3479,23 +3760,69 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                         history_text += f"Assistant: {model_msg}\n"
                 system_instruction += history_text
             
-            # Use Gemini 2.5 Flash for conversational responses with memory
-            # Wrap in asyncio.to_thread to avoid blocking event loop
-            def _generate():
-                return gen_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=text,
-                    config=types.GenerateContentConfig(
+            def _is_api_key_live_error(exc: Exception) -> bool:
+                msg = str(exc)
+                return (
+                    "API keys are not supported" in msg
+                    or "1008" in msg
+                    or "1007" in msg
+                    or "Invalid resource field value" in msg
+                    or "UNAUTHENTICATED" in msg
+                )
+
+            # Prefer API-key Live API; fallback to Vertex Live OAuth when API keys are rejected.
+            conversation_model = (os.getenv("AERIVON_CONVERSATION_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+            response_text_parts: list[str] = []
+
+            async def _run_conversation_session(live_client: genai.Client, model_name: str) -> str:
+                collected: list[str] = []
+                async with live_client.aio.live.connect(
+                    model=model_name,
+                    config=types.LiveConnectConfig(
+                        response_modalities=[types.Modality.TEXT],
                         system_instruction=system_instruction + "\nIf the user asks for help debugging/building, be detailed and actionable.",
                         temperature=0.6,
-                        max_output_tokens=3000  # Increased from 1800 for complete responses
+                        max_output_tokens=3000,
+                    ),
+                ) as session:
+                    await session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=text)],
+                        ),
+                        turn_complete=True,
                     )
-                )
-            response = await asyncio.to_thread(_generate)
+
+                    async for live_resp in session.receive():
+                        if live_resp.text:
+                            collected.append(live_resp.text)
+                        if live_resp.server_content and live_resp.server_content.turn_complete:
+                            break
+                return "".join(collected).strip()
+
+            try:
+                chat_client = _make_genai_client(role="chat", prefer_vertex=False, project=project, location=location)
+                response_text = await _run_conversation_session(chat_client, conversation_model)
+            except Exception as exc:
+                if not (_is_api_key_live_error(exc) and project):
+                    raise
+                print(f"[AERIVON CONVO] API key Live rejected, retrying with Vertex OAuth: {exc}", file=sys.stderr)
+                vertex_client = _make_genai_client(role="chat", prefer_vertex=True, project=project, location=location)
+                vertex_live_model = (os.getenv("AERIVON_VERTEX_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+                response_text = await _run_conversation_session(vertex_client, vertex_live_model)
+
+            response_text_parts.append(response_text)
+
+            class _SimpleResponse:
+                def __init__(self, text_value: str) -> None:
+                    self.text = text_value
+
+            response = _SimpleResponse("".join(response_text_parts).strip())
             
             model_response_text = ""
             if response.text:
                 model_response_text = response.text
+                context["last_assistant_text"] = response.text
                 await websocket.send_json({
                     "type": "text",
                     "text": response.text
@@ -3528,6 +3855,8 @@ Make it engaging and visual, incorporating elements from the gathered informatio
             await websocket.send_json({"type": "error", "error": f"Conversation failed: {str(e)}"})
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
+        finally:
+            context["engine_mode"] = None
     
     async def handle_audio_input(wav_bytes: bytes):
         """Handle audio input - transcribe and respond."""
@@ -3540,24 +3869,103 @@ Make it engaging and visual, incorporating elements from the gathered informatio
             await websocket.send_json({"type": "thinking", "text": "Listening to your voice..."})
             
             # Use Gemini to transcribe the audio (simple transcription, not verbose response)
-            # Wrap in asyncio.to_thread to avoid blocking event loop
-            def _transcribe():
-                return gen_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        types.Part.from_text(text="Transcribe this audio into text. Return ONLY the exact words spoken, nothing more. Do not add any commentary, explanation, or response. Just the transcription."),
-                        types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,  # Lower temperature for accurate transcription
-                        max_output_tokens=200  # Reduced from 500 - just transcription
-                    )
+            def _is_api_key_live_error(exc: Exception) -> bool:
+                msg = str(exc)
+                return (
+                    "API keys are not supported" in msg
+                    or "1008" in msg
+                    or "1007" in msg
+                    or "Invalid resource field value" in msg
+                    or "UNAUTHENTICATED" in msg
                 )
-            response = await asyncio.to_thread(_transcribe)
+
+            # Prefer API-key Live API for transcription; fallback to Vertex Live OAuth if needed.
+            transcription_model = (os.getenv("AERIVON_AUDIO_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+            transcription_parts: list[str] = []
+
+            async def _run_transcription_session(live_client: genai.Client, model_name: str) -> str:
+                collected: list[str] = []
+                async with live_client.aio.live.connect(
+                    model=model_name,
+                    config=types.LiveConnectConfig(
+                        response_modalities=[types.Modality.TEXT],
+                        temperature=0.0,
+                        max_output_tokens=200,
+                        system_instruction=(
+                            "Transcribe user audio into text. Return ONLY the exact words spoken, nothing more. "
+                            "Do not add commentary, explanation, or assistant response. "
+                            "If both assistant voice and user voice are present, transcribe only the USER speech."
+                        ),
+                    ),
+                ) as session:
+                    await session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                            ],
+                        ),
+                        turn_complete=True,
+                    )
+
+                    async for live_resp in session.receive():
+                        if live_resp.text:
+                            collected.append(live_resp.text)
+                        if live_resp.server_content and live_resp.server_content.turn_complete:
+                            break
+                return "".join(collected).strip()
+
+            try:
+                chat_client = _make_genai_client(role="chat", prefer_vertex=False, project=project, location=location)
+                transcription_text = await _run_transcription_session(chat_client, transcription_model)
+            except Exception as exc:
+                if not (_is_api_key_live_error(exc) and project):
+                    raise
+                print(f"[AERIVON AUDIO] API key Live rejected, retrying with Vertex OAuth: {exc}", file=sys.stderr)
+                vertex_client = _make_genai_client(role="chat", prefer_vertex=True, project=project, location=location)
+                vertex_live_model = (os.getenv("AERIVON_VERTEX_LIVE_MODEL") or "gemini-2.0-flash-live-preview-04-09").strip()
+                transcription_text = await _run_transcription_session(vertex_client, vertex_live_model)
+
+            transcription_parts.append(transcription_text)
+
+            class _SimpleResponse:
+                def __init__(self, text_value: str) -> None:
+                    self.text = text_value
+
+            response = _SimpleResponse("".join(transcription_parts).strip())
             
             if response.text:
                 # Extract the transcribed text for intent detection
                 transcribed_text = response.text.strip()
+
+                # Ignore likely assistant-echo / feedback-loop transcriptions.
+                transcribed_lower = transcribed_text.lower()
+                assistant_echo_markers = (
+                    "i can't directly interact with websites",
+                    "i cannot directly interact with websites",
+                    "i can, however, write you a short story",
+                    "what kind of story would you like",
+                    "is there anything else i can help you with",
+                )
+                last_assistant_text = str(context.get("last_assistant_text") or "").strip().lower()
+                is_refusal_echo = any(marker in transcribed_lower for marker in assistant_echo_markers)
+                is_last_assistant_echo = (
+                    len(last_assistant_text) >= 24
+                    and (
+                        transcribed_lower in last_assistant_text
+                        or last_assistant_text in transcribed_lower
+                    )
+                )
+
+                if is_refusal_echo or is_last_assistant_echo:
+                    print(f"[AERIVON AUDIO] Ignoring likely assistant-echo transcription: {transcribed_text}", file=sys.stderr)
+                    await websocket.send_json({
+                        "type": "thinking",
+                        "text": "I heard overlap from my own voice. Please repeat your request while I stay quiet."
+                    })
+                    context["state"] = "IDLE"
+                    await websocket.send_json({"type": "status", "state": "IDLE"})
+                    return
                 
                 # Show what was heard
                 await websocket.send_json({
@@ -3576,6 +3984,9 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                 await websocket.send_json({"type": "status", "state": "IDLE"})
                 
         except Exception as e:
+            import traceback
+            print(f"[AERIVON AUDIO] Audio processing failed: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             await websocket.send_json({"type": "error", "error": f"Audio processing failed: {str(e)}"})
             context["state"] = "IDLE"
             await websocket.send_json({"type": "status", "state": "IDLE"})
@@ -3617,26 +4028,60 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                 if msg_type == "interrupt":
                     # CRITICAL: Process interrupt immediately, do NOT queue it
                     log(f"[INTERRUPT] Received interrupt, active_task: {context.get('active_task')}")
-                    
-                    # Set cancel flag FIRST
-                    context["cancel_flag"] = True
-                    
-                    # Cancel active task if running
-                    if context.get("active_task"):
-                        log("[INTERRUPT] Cancelling active_task...")
-                        context["active_task"].cancel()
+                    cancellable_modes = {"ui", "story", "hybrid"}
+                    should_cancel = bool(context.get("execution_lock") or context.get("engine_mode") in cancellable_modes)
+
+                    if not should_cancel:
+                        await websocket.send_json({"type": "interrupted", "source": "client", "ignored": True})
+                        continue
                     
                     # Send acknowledgment IMMEDIATELY
                     log("[INTERRUPT] Sending acknowledgment...")
                     await websocket.send_json({"type": "interrupted", "source": "client"})
                     log("[INTERRUPT] Acknowledgment sent ✅")
+
+                    context["cancel_flag"] = True
+                    context["suppress_cancel_notice"] = True
+
+                    # Cancel active task if running
+                    if context.get("active_task"):
+                        log("[INTERRUPT] Cancelling active_task...")
+                        context["active_task"].cancel()
                     
                     # Reset state
                     context["state"] = "IDLE"
                     await websocket.send_json({"type": "status", "state": "IDLE"})
-                    context["cancel_flag"] = False
+                    context["execution_lock"] = False
+                    context["engine_mode"] = None
                     
                     # Do NOT queue interrupt - it's fully handled here
+                elif (
+                    msg_type in {"audio", "audio_end", "text"}
+                    and context.get("active_task")
+                    and not context.get("barge_in_pending")
+                    and (context.get("execution_lock") or context.get("engine_mode") in {"ui", "story", "hybrid"})
+                ):
+                    # Barge-in: user started speaking/typing while agent is still processing or narrating.
+                    context["barge_in_pending"] = True
+                    log(f"[BARGE-IN] Received {msg_type} while active task running. Cancelling current task.")
+
+                    context["cancel_flag"] = True
+                    context["suppress_cancel_notice"] = True
+                    active_task = context.get("active_task")
+                    if active_task:
+                        active_task.cancel()
+
+                    await websocket.send_json({"type": "interrupted", "source": "barge_in"})
+                    context["state"] = "IDLE"
+                    await websocket.send_json({"type": "status", "state": "IDLE"})
+
+                    # Queue the new user message so processor handles it next.
+                    await message_queue.put(data)
+
+                    # Reset interruption flags for next turn.
+                    context["execution_lock"] = False
+                    context["engine_mode"] = None
+                    context["barge_in_pending"] = False
                     
                 else:
                     # All non-interrupt messages go to the queue
@@ -3671,6 +4116,9 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                         await handle_text_message(text)
                 
                 elif msg_type == "audio":
+                    if time.time() < float(context.get("ignore_audio_until") or 0.0):
+                        # Drop likely speaker-echo audio while suppression window is active.
+                        continue
                     # Buffer PCM audio chunks
                     b64 = str(data.get("data_b64") or "")
                     if b64:
@@ -3683,6 +4131,10 @@ Make it engaging and visual, incorporating elements from the gathered informatio
                             pass
                 
                 elif msg_type == "audio_end":
+                    if time.time() < float(context.get("ignore_audio_until") or 0.0):
+                        # Ignore end marker for dropped echo audio and clear any partial buffer.
+                        audio_pcm.clear()
+                        continue
                     # Process the buffered audio
                     if audio_pcm:
                         context["state"] = "LISTENING"
@@ -3945,12 +4397,12 @@ async def post_agent_message_stream(payload: AgentMessageRequest, request: Reque
             os.getenv("AERIVON_SSE_MODEL")
             or os.getenv("GEMINI_FALLBACK_MODEL")
             or os.getenv("AERIVON_WS_FALLBACK_MODEL")
-            or "gemini-2.5-flash"
+            or "gemini-1.5-flash"
         ).strip()
         model = resolve_fallback_model(project, location, preferred_model) if project else preferred_model
 
         try:
-            client = _make_genai_client(prefer_vertex=prefer_vertex, project=project, location=location)
+            client = _make_genai_client(role="chat", prefer_vertex=prefer_vertex, project=project, location=location)
         except Exception as exc:
             yield sse("error", {"type": "error", "error": str(exc)})
             yield sse("done", {"type": "done"})

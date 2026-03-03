@@ -15,7 +15,8 @@ from tools import TOOL_REGISTRY
 
 
 LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-live-preview-04-09")
-FALLBACK_MODEL = "gemini-1.5-flash"
+# Default standard (non-Live) model for generate_content. Prefer Gemini 3.1 Pro.
+FALLBACK_MODEL = "gemini-3.1-pro"
 API_KEY_ENV_VARS = ("GOOGLE_CLOUD_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 SYSTEM_INSTRUCTION = """
@@ -112,6 +113,8 @@ def resolve_fallback_model(project: str | None, location: str, preferred: str) -
             return preferred
 
         for candidate in (
+            # Prefer newest, then gracefully fall back to broadly available models
+            "gemini-3.1-pro",
             "gemini-2.5-flash",
             "gemini-2.0-flash-001",
             "gemini-2.0-flash-lite-001",
@@ -280,7 +283,8 @@ class GeminiLiveClient:
         elif self.api_key:
             # Standard Gemini API key mode (non-Vertex). Live streaming may not be available.
             self.mode = "fallback"
-            self.model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-pro-preview")
+            # Use Gemini 3.1 Pro by default when using API key mode.
+            self.model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-pro")
             self.fallback_model = self.model
             self.client = genai.Client(api_key=self.api_key)
 
