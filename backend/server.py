@@ -2584,14 +2584,31 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         "execution_lock": False,
     }
 
-    ECHO_SUPPRESS_SECONDS = float(os.getenv("AERIVON_ECHO_SUPPRESS_SECONDS", "1.4"))
+    ECHO_SUPPRESS_SECONDS = float(os.getenv("AERIVON_ECHO_SUPPRESS_SECONDS", "2.8"))
 
     def _mark_echo_suppression_window(*, audio_bytes: int = 0) -> None:
         base = ECHO_SUPPRESS_SECONDS
         # 24kHz, 16-bit mono => 48000 bytes/sec
-        derived = (audio_bytes / 48000.0) * 0.8 if audio_bytes > 0 else 0.0
-        duration = max(base, min(3.5, derived))
+        derived = (audio_bytes / 48000.0) * 1.1 if audio_bytes > 0 else 0.0
+        duration = max(base, min(12.0, derived + 0.8))
         context["ignore_audio_until"] = max(float(context.get("ignore_audio_until") or 0.0), time.time() + duration)
+
+    def _looks_like_assistant_echo(transcribed_text: str, last_assistant_text: str) -> bool:
+        transcribed = (transcribed_text or "").strip().lower()
+        assistant = (last_assistant_text or "").strip().lower()
+        if not transcribed or not assistant:
+            return False
+
+        if len(assistant) >= 20 and (transcribed in assistant or assistant in transcribed):
+            return True
+
+        transcribed_tokens = {tok for tok in re.findall(r"[a-z0-9']+", transcribed) if len(tok) > 2}
+        assistant_tokens = {tok for tok in re.findall(r"[a-z0-9']+", assistant) if len(tok) > 2}
+        if not transcribed_tokens or not assistant_tokens:
+            return False
+
+        overlap = len(transcribed_tokens & assistant_tokens) / max(1, len(transcribed_tokens))
+        return overlap >= 0.65 and len(transcribed_tokens) >= 5
 
     def _validate_execution_output(response_text: str) -> None:
         lowered = (response_text or "").lower()
@@ -3946,16 +3963,16 @@ If no style is specified, use: {DEFAULT_STYLE}."""
                     "i can, however, write you a short story",
                     "what kind of story would you like",
                     "is there anything else i can help you with",
+                    "okay, what would you like to talk about",
+                    "okay, i'm ready. what would you like to talk about",
+                    "what would you like to talk about",
+                    "i can go to",
+                    "what are you hoping to find there",
+                    "what do you need me to do on",
                 )
                 last_assistant_text = str(context.get("last_assistant_text") or "").strip().lower()
                 is_refusal_echo = any(marker in transcribed_lower for marker in assistant_echo_markers)
-                is_last_assistant_echo = (
-                    len(last_assistant_text) >= 24
-                    and (
-                        transcribed_lower in last_assistant_text
-                        or last_assistant_text in transcribed_lower
-                    )
-                )
+                is_last_assistant_echo = _looks_like_assistant_echo(transcribed_text, last_assistant_text)
 
                 if is_refusal_echo or is_last_assistant_echo:
                     print(f"[AERIVON AUDIO] Ignoring likely assistant-echo transcription: {transcribed_text}", file=sys.stderr)
