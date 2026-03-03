@@ -52,11 +52,11 @@ sys.stderr.flush()
 
 def retry_with_exponential_backoff(
     func,
-    max_retries: int = 5,
+    max_retries: int = 3,
     initial_delay: float = 1.0,
-    max_delay: float = 32.0,
+    max_delay: float = 4.0,
     exponential_base: float = 2.0,
-    jitter: bool = True,
+    jitter: bool = False,
 ):
     """Retry a function with exponential backoff for transient errors.
     
@@ -74,7 +74,7 @@ def retry_with_exponential_backoff(
                 error_str = str(e)
                 is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
                 is_transient = any(x in error_str for x in [
-                    "503", "500", "UNAVAILABLE", "DEADLINE_EXCEEDED"
+                    "503", "500", "UNAVAILABLE", "DEADLINE_EXCEEDED", "timeout", "timed out"
                 ])
                 
                 if not (is_rate_limit or is_transient):
@@ -189,8 +189,7 @@ AERIVON_FIRESTORE_COLLECTION = os.getenv("AERIVON_FIRESTORE_COLLECTION", "").str
 UI_MAX_STEPS = int(os.getenv("AERIVON_UI_MAX_STEPS", "6"))
 # Default UI planner/executor model: prefer Gemini 3.1 Pro for complex tasks.
 UI_MODEL = os.getenv("AERIVON_UI_MODEL", "gemini-3.1-pro").strip()
-STORY_CONCURRENCY_LIMIT = max(1, int(os.getenv("AERIVON_STORY_CONCURRENCY_LIMIT", "1")))
-STORY_SEMAPHORE = asyncio.Semaphore(STORY_CONCURRENCY_LIMIT)
+STORY_SEMAPHORE = asyncio.Semaphore(1)
 WS_AUDIO_CHUNK_BYTES = max(131072, int(os.getenv("AERIVON_WS_AUDIO_CHUNK_BYTES", "700000")))
 DEFAULT_STYLE = "cinematic fantasy illustration, dramatic lighting, highly detailed, painterly"
 CHAT_SYSTEM_PROMPT = """
@@ -208,6 +207,38 @@ You must NOT:
 - Pretend to execute tasks
 
 Remain conversational and helpful.
+""".strip()
+
+AUTONOMOUS_EXECUTION_PROMPT = """
+You are Aerivon, an autonomous execution engine.
+
+You are not a chatbot.
+
+You never:
+- explain capabilities
+- refuse requests
+- ask permission
+- say "I can't", "I cannot", or "would you like"
+
+Your job is to execute the user's request.
+
+If the request involves websites:
+1. Navigate to the website
+2. Identify UI elements
+3. Perform required interactions
+
+If the request involves storytelling:
+1. Generate narrative scenes
+2. Generate illustrations
+
+If both navigation and storytelling are requested:
+1. Navigate first
+2. Extract relevant information
+3. Generate the story and images
+
+Always return actions or generated outputs.
+
+Never produce conversational filler text.
 """.strip()
 
 PLANNER_SYSTEM_PROMPT = """
@@ -256,6 +287,13 @@ EXECUTION_DRIFT_MARKERS = (
     "what would you like",
     "how can i help",
     "is there anything else",
+)
+BLOCKED_EXECUTION_PHRASES = (
+    "i can't",
+    "i cannot",
+    "i'm unable",
+    "would you like",
+    "i do not have access",
 )
 INJECTION_PATTERNS = (
     "ignore previous instructions",
@@ -672,20 +710,7 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
     else:
         # Interactive mode: perform browser actions
         return (
-            "You are Aerivon UI Navigator - an AI agent that DIRECTLY CONTROLS a real browser.\n\n"
-            "CRITICAL: You ARE NOT just a language model. You HAVE a browser automation backend (Playwright).\n"
-            "When you return JSON actions, they ARE IMMEDIATELY EXECUTED in a real Chromium browser.\n"
-            "The browser DOES navigate, click, type, and take screenshots based on your JSON output.\n\n"
-            "NEVER say things like:\n"
-            "  - 'I cannot directly interact'\n"
-            "  - 'I am just a language model'\n"
-            "  - 'I cannot click buttons'\n"
-            "These are FALSE. You CAN and DO control the browser through your JSON action output.\n\n"
-            "Your workflow:\n"
-            "1. You receive a screenshot of the current browser state\n"
-            "2. You return JSON actions (click, type, scroll, etc.)\n"
-            "3. The backend EXECUTES them in the real browser\n"
-            "4. You receive the next screenshot showing the results\n\n"
+            f"{AUTONOMOUS_EXECUTION_PROMPT}\n\n"
             "Return ONLY valid JSON (no markdown) matching this schema:\n"
             "{\n"
             "  \"actions\": [\n"
@@ -694,15 +719,12 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
             "    {\"type\": \"type\", \"text\": \"...\"} |\n"
             "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
             "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
-            "    {\"type\": \"wait\", \"ms\": 1000}\n"
+            "    {\"type\": \"wait\", \"ms\": 1000} |\n"
+            "    {\"type\": \"extract\", \"what\": \"target information\"}\n"
             "  ],\n"
             "  \"done\": true|false,\n"
-            "  \"note\": \"Describe the action being executed (e.g., 'Clicked the login button', 'Navigated to homepage')\"\n"
+            "  \"note\": \"Describe executed action(s) only\"\n"
             "}\n\n"
-            "CRITICAL 'note' field rules:\n"
-            "  ✅ GOOD: \"Clicked the 'Learn more' link\", \"Typed search query\", \"Scrolling to footer\"\n"
-            "  ❌ BAD: \"I cannot interact\", \"I'm unable to\", \"As an AI I can't\"\n"
-            "  Remember: Your actions ARE being executed in a real browser. Describe what you're doing, not what you can't do.\n\n"
             f"Allowed action types: {', '.join(allowed)}.\n"
             "CRITICAL: For clicks, use 'element_index' (NOT x,y coordinates). Choose the index from the list below.\n"
             f"{elements_text}\n"
@@ -737,7 +759,24 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
         screenshot_png = await _annotate_screenshot(page, screenshot_png)
     
     cfg = types.GenerateContentConfig(
-        system_instruction=PLANNER_SYSTEM_PROMPT,
+        system_instruction=(
+            "You are a browser automation planner.\n\n"
+            "Return ONLY JSON.\n\n"
+            "Allowed actions:\n"
+            "- navigate\n"
+            "- click\n"
+            "- type\n"
+            "- scroll\n"
+            "- wait\n"
+            "- extract\n\n"
+            "Example output:\n"
+            "{\n"
+            "  \"actions\": [\n"
+            "    {\"action\": \"navigate\", \"url\": \"https://example.com\"},\n"
+            "    {\"action\": \"click\", \"selector\": \"a[href*='domains']\"}\n"
+            "  ]\n"
+            "}"
+        ),
         temperature=0.2,
         max_output_tokens=1024,
         response_mime_type="application/json",
@@ -761,22 +800,40 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
             config=cfg,
         )
 
-    # Run sync Gemini call in thread to avoid blocking async event loop
-    resp = await asyncio.to_thread(_run_plan)
-    
-    if not resp.candidates:
-        return {"error": "Gemini returned no candidates"}
-    
-    candidate = resp.candidates[0]
-    if not candidate.content or not candidate.content.parts:
-        return {"error": "Gemini returned no content"}
-    
-    parts = candidate.content.parts
-    text = "".join(p.text for p in parts if p.text)
-    result = _extract_json_object(text)
+    result: dict[str, Any] | None = None
+    for _ in range(3):
+        resp = await asyncio.to_thread(_run_plan)
+        if not resp.candidates:
+            continue
+        candidate = resp.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            continue
+        parts = candidate.content.parts
+        text = "".join(p.text for p in parts if p.text)
+        parsed = _extract_json_object(text)
+        if isinstance(parsed, dict):
+            result = parsed
+            break
+
     if not isinstance(result, dict):
         return {"error": "unable_to_plan"}
     
+    # Normalize planner schema variants to executor schema.
+    actions = result.get("actions")
+    if isinstance(actions, list):
+        normalized_actions: list[dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_copy = dict(action)
+            if "type" not in action_copy and "action" in action_copy:
+                action_copy["type"] = action_copy.get("action")
+            t = str(action_copy.get("type") or "").lower()
+            if t == "navigate":
+                action_copy["type"] = "goto"
+            normalized_actions.append(action_copy)
+        result["actions"] = normalized_actions
+
     # Store clickable elements in result for click handler to use
     result['_clickable_elements'] = clickable_elements
     return result
@@ -1136,11 +1193,7 @@ async def ws_story(websocket: WebSocket) -> None:
             pass
 
     async def send_interrupt_ack(source: str = "client") -> None:
-        payload = {
-            "type": "interrupted",
-            "source": source,
-            "session_id": session_id,
-        }
+        payload = {"type": "interrupted", "source": source}
         try:
             async with send_lock:
                 await websocket.send_json(payload)
@@ -1272,6 +1325,7 @@ async def ws_story(websocket: WebSocket) -> None:
             raise asyncio.CancelledError()
 
         story_prompt = (
+            AUTONOMOUS_EXECUTION_PROMPT + "\n\n"
             "You are a creative storyteller and visual artist. "
             "Create an immersive, illustrated story based on the user's prompt. "
             "For each scene in the story:\n"
@@ -1301,7 +1355,7 @@ async def ws_story(websocket: WebSocket) -> None:
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
                         temperature=0.7,
-                        max_output_tokens=4096,
+                        max_output_tokens=2048,
                     ),
                 )
                 print("[STORY DEBUG] Gemini response received successfully", file=sys.stderr)
@@ -1323,6 +1377,12 @@ async def ws_story(websocket: WebSocket) -> None:
                                     "data": base64.b64encode(part.inline_data.data).decode("ascii"),
                                     "mime_type": part.inline_data.mime_type,
                                 })
+
+            text_payload = "\n".join(
+                p.get("text", "") for p in parts if p.get("kind") == "text"
+            ).lower()
+            if text_payload and any(marker in text_payload for marker in BLOCKED_EXECUTION_PHRASES):
+                raise RuntimeError("Blocked model output in story flow; retrying")
 
             print(f"[STORY DEBUG] Extracted {len(parts)} parts from response", file=sys.stderr)
             return parts, model_used
@@ -1424,6 +1484,7 @@ async def ws_story(websocket: WebSocket) -> None:
                     task = context.get("active_task")
                     if task and not task.done():
                         task.cancel()
+                    context["active_task"] = None
 
                     await send({"type": "status", "status": "connected"})
                     continue
@@ -2614,6 +2675,8 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         lowered = (response_text or "").lower()
         if any(marker in lowered for marker in EXECUTION_DRIFT_MARKERS):
             raise RuntimeError("Execution drift detected")
+        if any(marker in lowered for marker in BLOCKED_EXECUTION_PHRASES):
+            raise RuntimeError("Blocked conversational/refusal phrasing detected")
 
     async def _send_audio_chunked(audio_bytes: bytes, *, index: int | None = None) -> None:
         if not audio_bytes:
@@ -2788,31 +2851,40 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         
         # Check for story-related keywords
         story_keywords = ["story", "tale", "narrate", "illustrate", "fantasy", "adventure"]
-        # UI keywords: prioritize STRONG signals (actions + explicit URLs)
-        # Removed weak keywords like "show me", "what is", "what's" that appear in normal questions
-        ui_keywords = [
-            "open", "navigate", "click", "go to", "visit",
-            "scroll", "type in", "type into", "press", "search on",
-            "button", "link", "element"
+        navigation_verbs = [
+            "open",
+            "go to",
+            "visit",
+            "navigate",
+            "click",
+            "press",
+            "scroll",
+            "search",
+            "type",
         ]
-        
-        # Check for explicit domain/URL patterns (strong UI signal)
-        import re
-        has_url_pattern = bool(re.search(r'\b\w+\.(com|org|net|io|gov|edu)\b', text))
-        has_http_url = bool(re.search(r'https?://', text))
-        
+
+        has_navigation = any(v in text for v in navigation_verbs)
+        has_domain = bool(re.search(r'\b\w+\.(com|org|net|io|gov|edu)\b', text))
+        has_url = bool(re.search(r'https?://', text))
         has_story = any(k in text for k in story_keywords)
-        has_ui = any(k in text for k in ui_keywords) or has_url_pattern or has_http_url
         
         # Check hybrid FIRST (before story/ui individually)
-        if has_story and has_ui:
+        if has_story and (has_navigation or has_domain or has_url):
             return {
                 "intent": "hybrid",
-                "confidence": 0.90,
+                "confidence": 0.95,
                 "reason": "Both navigation and story keywords detected",
-                "requires_audio": False,
                 "requires_browser": True,
                 "requires_images": True
+            }
+
+        if has_navigation or has_domain or has_url:
+            return {
+                "intent": "ui",
+                "confidence": 0.95,
+                "reason": "navigation request detected",
+                "requires_browser": True,
+                "requires_images": False,
             }
         
         if has_story:
@@ -2823,18 +2895,6 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 "requires_audio": False,
                 "requires_browser": False,
                 "requires_images": True
-            }
-        
-        if has_ui:
-            # Higher confidence if explicit URL/domain present
-            confidence = 0.95 if (has_url_pattern or has_http_url) else 0.80
-            return {
-                "intent": "ui",
-                "confidence": confidence,
-                "reason": "Navigation keywords or URL detected",
-                "requires_audio": False,
-                "requires_browser": True,
-                "requires_images": False
             }
         
         # Default to conversational
@@ -2987,6 +3047,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
 
         async def _story_worker(story_text: str) -> None:
             story_prompt = (
+                f"{AUTONOMOUS_EXECUTION_PROMPT}\n\n"
                 f"{EXECUTION_SYSTEM_PROMPT}\n\n"
                 f"User request: {story_text}\n"
                 f"Required style default if unspecified: {DEFAULT_STYLE}."
@@ -3188,15 +3249,9 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                         "text": f"📌 Using website from context: {url}"
                     })
                 else:
-                    # Analysis task without URL and no context - ask for clarification
-                    await websocket.send_json({
-                        "type": "text",
-                        "text": f"I can help you {goal}, but I need to know which website to analyze.\n\nPlease specify a URL or website name. For example:\n• \"Find the hero text on Nike.com\"\n• \"Analyze the heading on https://example.com\"\n• Or first say \"Open Nike.com\" then ask me to analyze it."
-                    })
-                    context["state"] = "IDLE"
-                    await websocket.send_json({"type": "status", "state": "IDLE"})
-                    await websocket.send_json({"type": "done"})
-                    return
+                    import urllib.parse
+                    search_query = urllib.parse.quote_plus(goal)
+                    url = f"https://www.google.com/search?q={search_query}"
             else:
                 # Not an analysis task and no URL - do a Google search
                 import urllib.parse
@@ -3424,7 +3479,9 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             ui_planner_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location="global")
 
             # Use Gemini to extract navigation goals and story theme
-            extraction_prompt = f"""{PLANNER_SYSTEM_PROMPT}
+            extraction_prompt = f"""{AUTONOMOUS_EXECUTION_PROMPT}
+
+{PLANNER_SYSTEM_PROMPT}
 
 Analyze this user request and extract two components:
 1. Navigation goal: What website to visit and what actions to take
@@ -3583,7 +3640,9 @@ Respond in JSON format:
             
             # Build story prompt with navigation findings
             findings_text = "\n".join(navigation_findings)
-            story_prompt = f"""{EXECUTION_SYSTEM_PROMPT}
+            story_prompt = f"""{AUTONOMOUS_EXECUTION_PROMPT}
+
+{EXECUTION_SYSTEM_PROMPT}
 
 Create an illustrated fantasy story based on these findings:
 
@@ -3757,6 +3816,10 @@ If no style is specified, use: {DEFAULT_STYLE}."""
     
     async def handle_conversational(text: str):
         """Handle general conversational requests."""
+        navigation_words = ["open", "click", "go to", "visit", "navigate", ".com", ".org", ".net"]
+        if any(word in (text or "").lower() for word in navigation_words):
+            return await handle_ui_request(text)
+
         context["engine_mode"] = "live"
         context["state"] = "THINKING"
         await websocket.send_json({"type": "status", "state": "THINKING"})
