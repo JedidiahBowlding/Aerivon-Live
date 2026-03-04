@@ -34,7 +34,7 @@ async def one(iteration: int):
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
             except TimeoutError:
                 return False, None, "interrupt_wait_timeout"
-            if msg.get("type") == "status" and msg.get("status") == "interrupted":
+            if msg.get("type") == "interrupted" and msg.get("source") == "client":
                 ack = time.perf_counter() - interrupt_start
                 break
             if msg.get("type") == "error":

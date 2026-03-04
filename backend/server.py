@@ -1392,7 +1392,19 @@ async def ws_story(websocket: WebSocket) -> None:
         async with STORY_SEMAPHORE:
             if context["cancel_flag"]:
                 raise asyncio.CancelledError()
-            parts, model_used = await asyncio.to_thread(_run_story)
+            story_worker = asyncio.create_task(asyncio.to_thread(_run_story))
+            while True:
+                if context["cancel_flag"]:
+                    if not story_worker.done():
+                        story_worker.add_done_callback(
+                            lambda task: task.exception() if not task.cancelled() else None
+                        )
+                    raise asyncio.CancelledError()
+
+                done, _ = await asyncio.wait({story_worker}, timeout=0.2)
+                if done:
+                    parts, model_used = story_worker.result()
+                    break
 
         if context["cancel_flag"]:
             raise asyncio.CancelledError()
