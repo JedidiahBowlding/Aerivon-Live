@@ -29,6 +29,7 @@ async def one(iteration: int):
         await ws.send(json.dumps({"type": "interrupt"}))
 
         ack = None
+        saw_connected = False
         for _ in range(30):
             try:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
@@ -36,12 +37,17 @@ async def one(iteration: int):
                 return False, None, "interrupt_wait_timeout"
             if msg.get("type") == "interrupted" and msg.get("source") == "client":
                 ack = time.perf_counter() - interrupt_start
+                continue
+            if ack is not None and msg.get("type") == "status" and msg.get("status") == "connected":
+                saw_connected = True
                 break
             if msg.get("type") == "error":
                 return False, None, f"error:{msg.get('error')}"
 
         if ack is None:
             return False, None, "no_interrupt_ack"
+        if not saw_connected:
+            return False, ack, "no_connected_after_interrupt"
 
         await ws.send(
             json.dumps(
@@ -56,7 +62,7 @@ async def one(iteration: int):
         images = 0
         for _ in range(80):
             try:
-                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=90))
             except TimeoutError:
                 return False, ack, "post_interrupt_timeout"
             if msg.get("type") == "image":
