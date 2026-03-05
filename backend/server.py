@@ -3336,10 +3336,6 @@ If no style is specified, use: {DEFAULT_STYLE}."""
     
     async def handle_conversational(text: str):
         """Handle general conversational requests."""
-        navigation_words = ["open", "click", "go to", "visit", "navigate", ".com", ".org", ".net"]
-        if any(word in (text or "").lower() for word in navigation_words):
-            return await handle_ui_request(text)
-
         context["engine_mode"] = "live"
         context["state"] = "THINKING"
         await websocket.send_json({"type": "status", "state": "THINKING"})
