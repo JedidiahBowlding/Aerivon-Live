@@ -844,309 +844,104 @@ async def _ui_screenshot_b64(page) -> tuple[str, bytes]:
     return base64.b64encode(png).decode("ascii"), png
 
 
-@app.websocket("/ws/ui")
-async def ws_ui(websocket: WebSocket) -> None:
-    """UI Navigator WS: Gemini multimodal plans JSON actions, backend executes via Playwright."""
 
-    await websocket.accept()
+async def handle_ui_request(
+    text: str, websocket: WebSocket, context: dict, gen_client: genai.Client
+) -> None:
+    """Main handler for UI navigation and execution."""
+    session_id = context.get("session_id")
+    page = context.get("page")
+    memory = context.get("memory", [])
+    current_task = context.get("current_task")
 
-    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes"}
-    project = os.getenv("GOOGLE_CLOUD_PROJECT")
-    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-    if not use_vertex or not project:
-        await websocket.send_json({"type": "error", "error": "Vertex not enabled"})
-        await websocket.close(code=1011)
+    async def send(payload: dict[str, Any]) -> None:
+        payload.setdefault("session_id", session_id)
+        await websocket.send_json(payload)
+
+    if not page:
+        await send({"type": "error", "error": "Browser context not initialized"})
         return
 
-    gen_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location=location)
+    async def safe_goto(url: str) -> None:
+        from tools import is_safe_url
 
-    session_id = int(time.time())
-    await websocket.send_json({"type": "status", "status": "connected", "session_id": session_id, "model": UI_MODEL})
+        if not is_safe_url(url):
+            raise ValueError("Blocked unsafe URL")
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(800)
 
-    cancel_flag = False
-    memory: list[str] = []
-    current_task: str | None = None
+    async def execute_action(action: dict[str, Any], clickable_elements: list[dict] | None = None) -> dict[str, Any]:
+        nonlocal page
+        if context.get("cancel_flag"):
+            return {"ok": False, "skipped": True, "reason": "cancelled"}
 
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                device_scale_factor=1,  # Prevent coordinate scaling issues
-                java_script_enabled=True,
-                ignore_https_errors=True,
-            )
-            page = await context.new_page()
+        t = str(action.get("type") or "").strip().lower()
+        if t == "goto":
+            url = str(action.get("url") or "")
+            await safe_goto(url)
+            return {"ok": True, "type": "goto", "url": url}
+        if t == "click":
+            if "element_index" in action:
+                idx = int(action.get("element_index") or 0)
+                if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
+                    return {"ok": False, "error": f"Invalid element_index: {idx}"}
+                el = clickable_elements[idx]
+                x, y = el['x'] + el['w'] // 2, el['y'] + el['h'] // 2
+            else:
+                x, y = int(action.get("x") or 0), int(action.get("y") or 0)
+            
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(1000) # Wait for nav or SPA update
+            return {"ok": True, "type": "click", "x": x, "y": y}
+        if t == "type":
+            await page.keyboard.type(str(action.get("text") or ""))
+            return {"ok": True, "type": "type"}
+        if t == "press":
+            await page.keyboard.press(str(action.get("key") or "Enter"))
+            return {"ok": True, "type": "press"}
+        if t == "scroll":
+            await page.mouse.wheel(0, int(action.get("delta_y") or 0))
+            return {"ok": True, "type": "scroll"}
+        return {"ok": False, "error": f"unknown action: {t}"}
 
-            async def send(payload: dict[str, Any]) -> None:
-                payload.setdefault("session_id", session_id)
-                await websocket.send_json(payload)
+    # If text is a URL, navigate directly.
+    if text.startswith(("http://", "https://")):
+        await send({"type": "status", "status": "navigating", "url": text})
+        await safe_goto(text)
+        b64, _ = await _ui_screenshot_b64(page)
+        await send({"type": "screenshot", "mime_type": "image/png", "data_b64": b64, "url": page.url})
+        return
 
-            async def safe_goto(url: str) -> None:
-                from tools import is_safe_url
+    task = text
+    if current_task is None:
+        context["current_task"] = task
+        memory.append(f"User intent: {task}")
+    else:
+        memory.append(f"User clarification: {task}")
+        task = current_task
 
-                if not is_safe_url(url):
-                    raise ValueError("Blocked unsafe URL")
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(800)
+    await send({"type": "status", "status": "planning", "task": task})
 
-            async def execute_action(action: dict[str, Any], clickable_elements: list[dict] | None = None) -> dict[str, Any]:
-                nonlocal cancel_flag, page
-                if cancel_flag:
-                    return {"ok": False, "skipped": True, "reason": "cancelled"}
+    for _ in range(UI_MAX_STEPS):
+        if context.get("cancel_flag"):
+            break
 
-                t = str(action.get("type") or "").strip().lower()
-                if t == "goto":
-                    url = str(action.get("url") or "")
-                    await safe_goto(url)
-                    return {"ok": True, "type": "goto", "url": url}
-                if t == "click":
-                    # Support element_index (new) or x,y coordinates (fallback)
-                    if "element_index" in action:
-                        idx = int(action.get("element_index") or 0)
-                        if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
-                            return {"ok": False, "error": f"Invalid element_index: {idx}", "max_index": len(clickable_elements or []) - 1}
-                        
-                        el = clickable_elements[idx]
-                        x = el['x'] + el['w'] // 2
-                        y = el['y'] + el['h'] // 2
-                        print(f"[UI NAV DEBUG] Using element_index {idx}: {el.get('tag')} \"{el.get('text', '')}\" at ({x},{y})", file=__import__("sys").stderr, flush=True)
-                    else:
-                        # Fallback to x,y coordinates
-                        x = int(action.get("x") or 0)
-                        y = int(action.get("y") or 0)
-                        print(f"[UI NAV DEBUG] Using x,y coordinates: ({x},{y})", file=__import__("sys").stderr, flush=True)
-                    
-                    # Debug: Identify the element at the click coordinates
-                    target_info = await page.evaluate(
-                        """([x, y]) => {
-                            const el = document.elementFromPoint(x, y);
-                            if (!el) return null;
-                            return {
-                                tag: el.tagName,
-                                text: (el.innerText || el.textContent || '').trim().slice(0, 50),
-                                href: el.href || el.closest('a')?.href || null,
-                                id: el.id || null,
-                                class: el.className || null
-                            };
-                        }""",
-                        [x, y],
-                    )
-                    
-                    print(f"[UI NAV DEBUG] Click target at ({x},{y}): {target_info}", file=__import__("sys").stderr, flush=True)
-                    
-                    if not target_info:
-                        return {"ok": False, "error": "No element at coordinates", "x": x, "y": y}
-                    
-                    # Track state before click
-                    url_before = page.url
-                    
-                    # Click the actual DOM element (more reliable than mouse.click)
-                    try:
-                        element_handle = await page.evaluate_handle(
-                            """([x, y]) => document.elementFromPoint(x, y)""",
-                            [x, y],
-                        )
-                        if element_handle:
-                            element = element_handle.as_element()
-                            if element:
-                                await element.click()
-                            else:
-                                # Fallback to mouse click
-                                await page.mouse.click(x, y)
-                        else:
-                            # Fallback to mouse click
-                            await page.mouse.click(x, y)
-                    except Exception as e:
-                        print(f"[UI NAV DEBUG] Element click failed, using mouse: {e}", file=__import__("sys").stderr, flush=True)
-                        await page.mouse.click(x, y)
-                    
-                    # Wait for navigation or content update
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=2000)
-                    except Exception:
-                        await page.wait_for_timeout(500)
-                    
-                    # Handle new tabs or popups
-                    if len(context.pages) > 1:
-                        page = context.pages[-1]
-                        await page.wait_for_load_state("domcontentloaded", timeout=2000)
-                    
-                    url_after = page.url
-                    
-                    # Verify something actually happened
-                    if url_after == url_before and not target_info.get('href'):
-                        # Might be SPA or button click - that's OK
-                        return {
-                            "ok": True,
-                            "type": "click",
-                            "x": x,
-                            "y": y,
-                            "url_after": url_after,
-                            "target": target_info,
-                            "navigation": False
-                        }
-                    
-                    return {
-                        "ok": True,
-                        "type": "click",
-                        "x": x,
-                        "y": y,
-                        "url_after": url_after,
-                        "target": target_info,
-                        "navigation": url_after != url_before
-                    }
-                if t == "type":
-                    text = str(action.get("text") or "")
-                    await page.keyboard.type(text)
-                    return {"ok": True, "type": "type", "text": text}
-                if t == "press":
-                    key = str(action.get("key") or "Enter")
-                    await page.keyboard.press(key)
-                    await page.wait_for_timeout(600)
-                    return {"ok": True, "type": "press", "key": key}
-                if t == "scroll":
-                    dy = int(action.get("delta_y") or 0)
-                    await page.mouse.wheel(0, dy)
-                    await page.wait_for_timeout(300)
-                    return {"ok": True, "type": "scroll", "delta_y": dy}
-                if t == "wait":
-                    ms = int(action.get("ms") or 0)
-                    await page.wait_for_timeout(max(0, ms))
-                    return {"ok": True, "type": "wait", "ms": ms}
+        b64, png = await _ui_screenshot_b64(page)
+        plan = await _ui_plan_actions(client=gen_client, screenshot_png=png, task=task, memory=memory, page=page)
+        await send({"type": "actions", "plan": plan})
+        memory.append(f"Planned: {json.dumps(plan, ensure_ascii=False)}")
 
-                return {"ok": False, "error": f"unknown action type: {t}"}
+        actions = plan.get("actions") or []
+        for action in actions:
+            if context.get("cancel_flag"):
+                break
+            res = await execute_action(action, plan.get("_clickable_elements"))
+            await send({"type": "action_result", "result": res})
+            memory.append(f"Executed: {json.dumps(res, ensure_ascii=False)}")
 
-            try:
-                while True:
-                    msg = await websocket.receive_json()
-                    if not isinstance(msg, dict):
-                        continue
-
-                    msg_type = str(msg.get("type") or "").strip().lower()
-
-                    if msg_type == "interrupt":
-                        cancel_flag = True
-                        await send({"type": "interrupted", "source": "client"})
-                        continue
-
-                    if msg_type == "open":
-                        cancel_flag = False
-                        # Starting a new navigation flow resets intent/memory.
-                        memory.clear()
-                        current_task = None
-                        url = str(msg.get("url") or "")
-                        await send({"type": "status", "status": "navigating", "url": url})
-                        await safe_goto(url)
-                        try:
-                            title = await page.title()
-                        except Exception:
-                            title = ""
-                        memory.append(f"Opened URL: {page.url} Title: {title}")
-                        b64, _png = await _ui_screenshot_b64(page)
-                        await send({"type": "screenshot", "mime_type": "image/png", "data_b64": b64, "url": page.url})
-                        await send({"type": "status", "status": "ready", "url": page.url})
-                        continue
-
-                    if msg_type == "task":
-                        cancel_flag = False
-                        task = str(msg.get("text") or "")
-                        if not task:
-                            await send({"type": "error", "error": "missing text"})
-                            continue
-
-                        # Persist the original intent across steps.
-                        if current_task is None:
-                            current_task = task
-                            memory.append(f"User intent: {current_task}")
-                        else:
-                            # Treat subsequent task messages as clarifications.
-                            memory.append(f"User clarification: {task}")
-
-                        task = current_task
-
-                        # Prevent planning against an empty page.
-                        if (page.url or "").startswith("about:blank"):
-                            await send({"type": "error", "error": "No page loaded yet. Click Open URL first."})
-                            continue
-
-                        await send({"type": "status", "status": "planning", "task": task})
-
-                        for step in range(UI_MAX_STEPS):
-                            if cancel_flag:
-                                await send({"type": "status", "status": "cancelled"})
-                                break
-
-                            b64, png = await _ui_screenshot_b64(page)
-                            try:
-                                title = await page.title()
-                            except Exception:
-                                title = ""
-                            memory.append(f"Step {step+1} URL: {page.url} Title: {title}")
-
-                            plan = await _ui_plan_actions(client=gen_client, screenshot_png=png, task=task, memory=memory, page=page)
-                            await send({"type": "actions", "step": step + 1, "plan": plan})
-
-                            memory.append(f"Planned: {json.dumps(plan, ensure_ascii=False)[:1500]}")
-
-                            # Extract clickable elements for click handler
-                            clickable_elements = plan.get("_clickable_elements") or []
-
-                            actions = plan.get("actions") or []
-                            if not isinstance(actions, list):
-                                await send({"type": "error", "error": "plan.actions must be a list"})
-                                break
-
-                            for idx, action in enumerate(actions):
-                                if cancel_flag:
-                                    await send({"type": "status", "status": "cancelled"})
-                                    break
-                                if not isinstance(action, dict):
-                                    await send({"type": "error", "error": "action must be an object"})
-                                    break
-                                res = await execute_action(action, clickable_elements)
-                                await send({"type": "action_result", "index": idx, "result": res})
-                                memory.append(f"Executed action {idx}: {json.dumps(action, ensure_ascii=False)} => {json.dumps(res, ensure_ascii=False)[:800]}")
-
-                            b64_after, _png_after = await _ui_screenshot_b64(page)
-                            await send(
-                                {
-                                    "type": "screenshot",
-                                    "mime_type": "image/png",
-                                    "data_b64": b64_after,
-                                    "url": page.url,
-                                }
-                            )
-
-                            if bool(plan.get("done")) is True:
-                                await send({"type": "status", "status": "done", "note": plan.get("note") or ""})
-                                memory.append(f"Done: {plan.get('note') or ''}")
-                                break
-
-                        continue
-
-            except WebSocketDisconnect:
-                return
-            finally:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-    except Exception as e:
-        import sys
-        import traceback
-        print(f"[WS/UI ERROR] Playwright/WebSocket error: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        try:
-            await websocket.send_json({"type": "error", "error": f"Server error: {str(e)}"})
-            await websocket.close(code=1011)
-        except Exception:
-            pass
-
+        if bool(plan.get("done")) is True:
+            await send({"type": "status", "status": "done", "note": plan.get("note") or ""})
+            break
 
 @app.websocket("/ws/story")
 async def ws_story(websocket: WebSocket) -> None:
@@ -2657,6 +2452,8 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         "execution_lock": False,
     }
 
+    gen_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location=location)
+
     ECHO_SUPPRESS_SECONDS = float(os.getenv("AERIVON_ECHO_SUPPRESS_SECONDS", "2.8"))
 
     def _mark_echo_suppression_window(*, audio_bytes: int = 0) -> None:
@@ -2863,6 +2660,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         
         # Check for story-related keywords
         story_keywords = ["story", "tale", "narrate", "illustrate", "fantasy", "adventure"]
+        
         navigation_verbs = [
             "open",
             "go to",
@@ -2879,13 +2677,12 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         has_domain = bool(re.search(r'\b\w+\.(com|org|net|io|gov|edu)\b', text))
         has_url = bool(re.search(r'https?://', text))
         has_story = any(k in text for k in story_keywords)
-        
+
         # Check hybrid FIRST (before story/ui individually)
         if has_story and (has_navigation or has_domain or has_url):
             return {
                 "intent": "hybrid",
                 "confidence": 0.95,
-                "reason": "Both navigation and story keywords detected",
                 "requires_browser": True,
                 "requires_images": True
             }
@@ -2896,7 +2693,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
                 "confidence": 0.95,
                 "reason": "navigation request detected",
                 "requires_browser": True,
-                "requires_images": False,
+                "requires_images": False
             }
         
         if has_story:
@@ -2967,7 +2764,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             if context["engine_mode"] == "live":
                 await run_with_cancel(handle_conversational(text))
             elif context["engine_mode"] == "ui":
-                await run_with_cancel(handle_ui_request(text))
+                await run_with_cancel(handle_ui_request(text, websocket, context, gen_client))
             elif context["engine_mode"] == "story":
                 await handle_story_request(text)
             elif context["engine_mode"] == "hybrid":
@@ -2982,6 +2779,8 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "status", "state": "IDLE"})
             return
     
+
+
     async def handle_story_request(prompt: str):
         """Handle story generation requests."""
         context["execution_lock"] = True
@@ -3187,298 +2986,7 @@ async def ws_aerivon_unified(websocket: WebSocket) -> None:
         )
         context["page"] = await context["browser_context"].new_page()
     
-    async def handle_ui_request(goal: str):
-        """Handle UI navigation requests with Playwright browser automation."""
-        context["engine_mode"] = "ui"
-        context["state"] = "NAVIGATING"
-        completion_note = "Task completed."
-        await websocket.send_json({"type": "status", "state": "NAVIGATING"})
-        await websocket.send_json({"type": "thinking", "text": f"Launching browser for: {goal}"})
-        
-        try:
-            ui_planner_client = _make_genai_client(role="planner", prefer_vertex=True, project=project, location="global")
 
-            # Ensure browser is ready (reuse if already open)
-            await ensure_browser()
-            page = context["page"]
-            # Infer URL from goal
-            goal_lower = goal.lower()
-            url = ""
-            
-            # Check if this is an analysis task without a specific URL
-            analysis_keywords = ["find", "analyze", "identify", "read", "get", "extract", "show", "what is", "what's", "hero text", "heading"]
-            is_analysis_task = any(kw in goal_lower for kw in analysis_keywords)
-            
-            # Try to extract or infer URL
-            # FIRST: Check for explicit URLs anywhere in the goal (e.g., "Open http://localhost")
-            import re
-            url_match = re.search(r'https?://[^\s]+', goal_lower)
-            if url_match:
-                url = url_match.group(0)
-            elif "nike" in goal_lower:
-                url = "https://www.nike.com"
-            elif "amazon" in goal_lower:
-                url = "https://www.amazon.com"
-            elif "google" in goal_lower:
-                url = "https://www.google.com"
-            elif "youtube" in goal_lower:
-                url = "https://www.youtube.com"
-            elif "github" in goal_lower:
-                url = "https://www.github.com"
-            elif is_analysis_task:
-                # Check conversation history for recent website mentions
-                recent_url = None
-                if context["conversation_history"]:
-                    # Look at last 3 exchanges for URLs or website names
-                    for ex in reversed(context["conversation_history"][-3:]):
-                        user_msg = ex.get("user", "").lower()
-                        model_msg = ex.get("model", "").lower()
-                        
-                        # Check for explicit URLs
-                        import re
-                        url_pattern = r'https?://[^\s]+'
-                        user_urls = re.findall(url_pattern, user_msg)
-                        model_urls = re.findall(url_pattern, model_msg)
-                        if user_urls:
-                            recent_url = user_urls[-1]
-                            break
-                        elif model_urls:
-                            recent_url = model_urls[-1]
-                            break
-                        
-                        # Check for website names
-                        if "nike" in user_msg or "nike" in model_msg:
-                            recent_url = "https://www.nike.com"
-                            break
-                        elif "amazon" in user_msg or "amazon" in model_msg:
-                            recent_url = "https://www.amazon.com"
-                            break
-                
-                if recent_url:
-                    url = recent_url
-                    await websocket.send_json({
-                        "type": "text",
-                        "text": f"📌 Using website from context: {url}"
-                    })
-                else:
-                    import urllib.parse
-                    search_query = urllib.parse.quote_plus(goal)
-                    url = f"https://www.google.com/search?q={search_query}"
-            else:
-                # Not an analysis task and no URL - do a Google search
-                import urllib.parse
-                search_query = urllib.parse.quote_plus(goal)
-                url = f"https://www.google.com/search?q={search_query}"
-            
-            from tools import is_safe_url
-            if not is_safe_url(url):
-                await websocket.send_json({
-                    "type": "error",
-                    "error": f"🔒 Blocked unsafe URL: {url}"
-                })
-                context["state"] = "IDLE"
-                await websocket.send_json({"type": "status", "state": "IDLE"})
-                await websocket.send_json({"type": "done"})
-                return
-            
-            # Navigate to URL (browser already ensured above)
-            await websocket.send_json({
-                "type": "text",
-                "text": f"🌐 Opening {url}..."
-            })
-            
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1000)
-            
-            page_title = await page.title()
-            await websocket.send_json({
-                "type": "text",
-                "text": f"✅ Loaded: {page_title}"
-            })
-            
-            # Take screenshot
-            b64, png = await _ui_screenshot_b64(page)
-            await websocket.send_json({
-                "type": "screenshot",
-                "mime_type": "image/png",
-                "data_b64": b64,
-                "url": page.url
-            })
-            
-            # Determine if we need action planning or if this is just "open the page"
-            analysis_keywords = [
-                "find", "what is", "what's", "analyze", "identify", "read", 
-                "show me", "get the", "extract", "tell me", "hero text", "heading",
-                "largest text", "main text", "title", "click", "search", "type"
-            ]
-            simple_navigation_only = [
-                "open", "go to", "visit", "navigate to", "load", "show me the website"
-            ]
-            
-            # Check if this is an analysis/interaction task (not just opening a page)
-            has_analysis_intent = any(kw in goal_lower for kw in analysis_keywords)
-            is_simple_navigation = (
-                any(nav in goal_lower for nav in simple_navigation_only) and 
-                not has_analysis_intent
-            )
-            
-            # Run action planning if there's more to do than just opening the page
-            if not is_simple_navigation:
-                completion_note = "Task completed."
-                await websocket.send_json({
-                    "type": "text",
-                    "text": f"🤖 Planning actions to: {goal}"
-                })
-                
-                memory = [
-                    f"User goal: {goal}",
-                    f"Current URL: {page.url}",
-                    f"Page title: {page_title}"
-                ]
-                completion_note = "Task completed."
-                
-                # Run planning loop (limited to 3 steps for Command Center)
-                for step in range(3):
-                    if context["cancel_flag"]:
-                        await websocket.send_json({"type": "text", "text": "⚠️ Cancelled by user"})
-                        break
-                    
-                    # Get action plan from Gemini
-                    plan = await _ui_plan_actions(
-                        client=ui_planner_client,
-                        screenshot_png=png,
-                        task=goal,
-                        memory=memory,
-                        page=page
-                    )
-                    
-                    # Send action plan to frontend for display
-                    await websocket.send_json({
-                        "type": "actions",
-                        "step": step + 1,
-                        "plan": plan
-                    })
-                    
-                    await websocket.send_json({
-                        "type": "text",
-                        "text": f"📋 Step {step + 1}: {plan.get('note', 'Executing actions...')}"
-                    })
-                    
-                    # Execute actions
-                    clickable_elements = plan.get("_clickable_elements") or []
-                    actions = plan.get("actions") or []
-                    
-                    for idx, action in enumerate(actions):
-                        if context["cancel_flag"]:
-                            await websocket.send_json({
-                                "type": "action_result",
-                                "index": idx,
-                                "result": {"success": False, "message": "Cancelled"}
-                            })
-                            break
-                        
-                        action_type = str(action.get("type", "")).lower()
-                        result = {"success": True, "message": "Done"}
-                        
-                        try:
-                            # Validate goto URLs before navigation (SSRF protection)
-                            if action_type == "goto":
-                                goto_url = str(action.get("url", ""))
-                                from tools import is_safe_url
-                                if not is_safe_url(goto_url):
-                                    result = {"success": False, "message": f"Blocked unsafe URL: {goto_url}"}
-                                    await websocket.send_json({
-                                        "type": "action_result",
-                                        "index": idx,
-                                        "result": result
-                                    })
-                                    continue
-                                await page.goto(goto_url, wait_until="domcontentloaded", timeout=45000)
-                                await page.wait_for_timeout(1000)
-                                result["message"] = f"Navigated to {goto_url}"
-                            # Execute action (simplified version)
-                            elif action_type == "click":
-                                if "element_index" in action:
-                                    el_idx = int(action.get("element_index", 0))
-                                    if 0 <= el_idx < len(clickable_elements):
-                                        el = clickable_elements[el_idx]
-                                        x = el['x'] + el['w'] // 2
-                                        y = el['y'] + el['h'] // 2
-                                        await page.mouse.click(x, y)
-                                        await page.wait_for_timeout(800)
-                                        result["message"] = f"Clicked element {el_idx}"
-                                    else:
-                                        result = {"success": False, "message": f"Invalid element index: {el_idx}"}
-                                else:
-                                    result = {"success": False, "message": "No element_index specified"}
-                            elif action_type == "type":
-                                text = str(action.get("text", ""))
-                                await page.keyboard.type(text)
-                                await page.wait_for_timeout(300)
-                                result["message"] = f"Typed: {text[:20]}..."
-                            elif action_type == "press":
-                                key = str(action.get("key", "Enter"))
-                                await page.keyboard.press(key)
-                                await page.wait_for_timeout(600)
-                                result["message"] = f"Pressed {key}"
-                            elif action_type == "scroll":
-                                dy = int(action.get("delta_y", 0))
-                                await page.mouse.wheel(0, dy)
-                                await page.wait_for_timeout(300)
-                                result["message"] = "Scrolled page"
-                            else:
-                                result = {"success": False, "message": f"Unknown action type: {action_type}"}
-                        except Exception as e:
-                            result = {"success": False, "message": f"Error: {str(e)}"}
-                        
-                        # Send action result to frontend
-                        await websocket.send_json({
-                            "type": "action_result",
-                            "index": idx,
-                            "result": result
-                        })
-                    
-                    # Screenshot after actions
-                    b64, png = await _ui_screenshot_b64(page)
-                    await websocket.send_json({
-                        "type": "screenshot",
-                        "mime_type": "image/png",
-                        "data_b64": b64,
-                        "url": page.url
-                    })
-                    
-                    memory.append(f"Step {step + 1} completed. URL: {page.url}")
-                    
-                    # Check if done
-                    if plan.get("done"):
-                        completion_note = plan.get('note', 'Task finished!')
-                        await websocket.send_json({
-                            "type": "text",
-                            "text": f"✨ Complete: {completion_note}"
-                        })
-                        
-                        # Narrate the result
-                        await narrate_and_send(completion_note)
-                        break
-            
-            context["state"] = "DONE"
-            await websocket.send_json({"type": "status", "state": "DONE"})
-            await websocket.send_json({"type": "done"})
-            
-        except Exception as e:
-            import traceback
-            error_msg = f"Navigation failed: {str(e)}"
-            print(f"[AERIVON UI NAV ERROR] {error_msg}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            
-            await websocket.send_json({
-                "type": "error",
-                "error": error_msg
-            })
-            context["state"] = "IDLE"
-            await websocket.send_json({"type": "status", "state": "IDLE"})
-        finally:
-            context["engine_mode"] = None
     
     async def handle_hybrid_request(request: str):
         """Handle hybrid requests that combine UI navigation and story generation."""

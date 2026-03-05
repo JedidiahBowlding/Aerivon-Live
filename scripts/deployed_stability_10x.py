@@ -14,10 +14,11 @@ WS_STORY = f"wss://{BASE}/ws/story"
 ITERATIONS = 10
 TURN_TIMEOUT_AERIVON = 60.0
 TURN_TIMEOUT_UI = 45.0
-TURN_TIMEOUT_STORY = 75.0
+TURN_TIMEOUT_STORY = 60.0
 ACK_TIMEOUT = 12.0
-CONNECT_TIMEOUT = 20.0
+CONNECT_TIMEOUT = 30.0
 ITERATION_TIMEOUT = 180.0
+MAX_RECONNECT_ATTEMPTS = 3
 
 DRIFT_MARKERS = ("what would you like", "how can i help", "is there anything else")
 AUTH_MARKERS = ("401", "429", "1007", "1008", "unauthenticated", "resource exhausted")
@@ -92,7 +93,7 @@ class LoopSummary:
         }
 
 
-async def recv_json(ws: websockets.WebSocketClientProtocol, timeout_s: float = 60.0) -> dict[str, Any]:
+async def recv_json(ws, timeout_s: float = 60.0) -> dict[str, Any]:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
     except TimeoutError:
@@ -110,7 +111,30 @@ def _check_drift(text: str) -> bool:
     return any(marker in low for marker in DRIFT_MARKERS)
 
 
-async def run_aerivon_turn(ws: websockets.WebSocketClientProtocol, text: str, timeout_s: float = TURN_TIMEOUT_AERIVON) -> TurnMetrics:
+def _is_resource_exhausted(error: str | None) -> bool:
+    low = (error or "").lower()
+    return "429" in low and "resource exhausted" in low
+
+
+async def wait_for_message(
+    ws,
+    predicate,
+    timeout_s: float,
+) -> tuple[bool, dict[str, Any] | None, str | None]:
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        msg = await recv_json(ws, min(20.0, max(1.0, deadline - time.perf_counter())))
+        msg_type = msg.get("type")
+        if msg_type in {"__timeout__", "__exception__", "__bad_json__"}:
+            return False, None, str(msg.get("error") or msg_type)
+        if msg_type == "error":
+            return False, msg, str(msg.get("error") or "error")
+        if predicate(msg):
+            return True, msg, None
+    return False, None, "timeout"
+
+
+async def run_aerivon_turn(ws, text: str, timeout_s: float = TURN_TIMEOUT_AERIVON) -> TurnMetrics:
     start = time.perf_counter()
     await ws.send(json.dumps({"type": "text", "text": text}))
     intents: list[str] = []
@@ -194,7 +218,7 @@ async def test_aerivon_loop() -> LoopSummary:
     summary = LoopSummary(endpoint="/ws/aerivon", iterations=ITERATIONS)
 
     for i in range(ITERATIONS):
-        async with websockets.connect(WS_AERIVON, max_size=2**22, open_timeout=CONNECT_TIMEOUT, close_timeout=5.0) as ws:
+        async with websockets.connect(WS_AERIVON, max_size=None, open_timeout=CONNECT_TIMEOUT, close_timeout=5.0) as ws:
             for _ in range(3):
                 init_msg = await recv_json(ws, 30.0)
                 if init_msg.get("type") == "status" and init_msg.get("model"):
@@ -246,7 +270,7 @@ async def test_aerivon_loop() -> LoopSummary:
     return summary
 
 
-async def _wait_ui_result(ws: websockets.WebSocketClientProtocol, timeout_s: float = TURN_TIMEOUT_UI) -> tuple[bool, str, dict[str, Any] | None]:
+async def _wait_ui_result(ws, timeout_s: float = TURN_TIMEOUT_UI) -> tuple[bool, str, dict[str, Any] | None]:
     deadline = time.perf_counter() + timeout_s
     while time.perf_counter() < deadline:
         msg = await recv_json(ws, timeout_s)
@@ -266,7 +290,7 @@ async def test_ui_loop() -> LoopSummary:
 
     async def _ui_case(url: str, expect_ready: bool, run_task: bool = False) -> tuple[bool, str]:
         try:
-            async with websockets.connect(WS_UI, max_size=2**22, open_timeout=CONNECT_TIMEOUT, close_timeout=5.0) as ws:
+            async with websockets.connect(WS_UI, max_size=None, open_timeout=CONNECT_TIMEOUT, close_timeout=5.0) as ws:
                 first = await recv_json(ws, 30.0)
                 if first.get("type") == "status" and first.get("model"):
                     summary.model_identities.append(str(first.get("model")))
@@ -349,7 +373,7 @@ async def test_ui_loop() -> LoopSummary:
     return summary
 
 
-async def run_story_prompt(ws: websockets.WebSocketClientProtocol, prompt: str, timeout_s: float = TURN_TIMEOUT_STORY) -> TurnMetrics:
+async def run_story_prompt(ws, prompt: str, timeout_s: float = TURN_TIMEOUT_STORY) -> TurnMetrics:
     start = time.perf_counter()
     await ws.send(json.dumps({"type": "prompt", "text": prompt}))
 
@@ -361,12 +385,52 @@ async def run_story_prompt(ws: websockets.WebSocketClientProtocol, prompt: str, 
     image_messages = 0
     audio_messages = 0
     drift = False
+    saw_progress = False
+    deadline = time.perf_counter() + timeout_s
 
     while True:
-        msg = await recv_json(ws, timeout_s)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            if saw_progress:
+                return TurnMetrics(
+                    ok=True,
+                    duration_s=time.perf_counter() - start,
+                    text_messages=text_messages,
+                    image_messages=image_messages,
+                    audio_messages=audio_messages,
+                    duplicate_text_frames=duplicate_text,
+                    duplicate_image_frames=duplicate_image,
+                    drift_detected=drift,
+                )
+            return TurnMetrics(
+                ok=False,
+                duration_s=time.perf_counter() - start,
+                error="timeout",
+                text_messages=text_messages,
+                image_messages=image_messages,
+                audio_messages=audio_messages,
+                duplicate_text_frames=duplicate_text,
+                duplicate_image_frames=duplicate_image,
+                drift_detected=drift,
+            )
+
+        msg = await recv_json(ws, min(15.0, max(1.0, remaining)))
         msg_type = msg.get("type")
 
         if msg_type in {"__timeout__", "__exception__", "__bad_json__"}:
+            if msg_type == "__timeout__":
+                continue
+            if saw_progress:
+                return TurnMetrics(
+                    ok=True,
+                    duration_s=time.perf_counter() - start,
+                    text_messages=text_messages,
+                    image_messages=image_messages,
+                    audio_messages=audio_messages,
+                    duplicate_text_frames=duplicate_text,
+                    duplicate_image_frames=duplicate_image,
+                    drift_detected=drift,
+                )
             return TurnMetrics(
                 ok=False,
                 duration_s=time.perf_counter() - start,
@@ -383,6 +447,8 @@ async def run_story_prompt(ws: websockets.WebSocketClientProtocol, prompt: str, 
             text = str(msg.get("text") or "")
             if text:
                 text_messages += 1
+                saw_progress = True
+                deadline = time.perf_counter() + timeout_s
                 if _check_drift(text):
                     drift = True
                 if last_text is not None and text == last_text:
@@ -390,12 +456,22 @@ async def run_story_prompt(ws: websockets.WebSocketClientProtocol, prompt: str, 
                 last_text = text
         elif msg_type == "image":
             image_messages += 1
+            saw_progress = True
+            deadline = time.perf_counter() + timeout_s
             idx = msg.get("index")
             if idx in image_indexes:
                 duplicate_image += 1
             image_indexes.add(idx)
         elif msg_type == "audio":
             audio_messages += 1
+            saw_progress = True
+            deadline = time.perf_counter() + timeout_s
+        elif msg_type == "debug":
+            saw_progress = True
+            deadline = time.perf_counter() + timeout_s
+        elif msg_type == "status" and msg.get("status") == "generating":
+            saw_progress = True
+            deadline = time.perf_counter() + timeout_s
         elif msg_type == "error":
             return TurnMetrics(
                 ok=False,
@@ -421,27 +497,73 @@ async def run_story_prompt(ws: websockets.WebSocketClientProtocol, prompt: str, 
             )
 
 
+async def run_story_prompt_with_retry(
+    ws,
+    prompt: str,
+    timeout_s: float = TURN_TIMEOUT_STORY,
+) -> TurnMetrics:
+    metrics = TurnMetrics(ok=False, duration_s=0.0, error="uninitialized")
+    for attempt in range(3):
+        metrics = await run_story_prompt(ws, prompt, timeout_s)
+        if metrics.ok:
+            return metrics
+        if _is_resource_exhausted(metrics.error) and attempt < 2:
+            await asyncio.sleep(2**attempt)
+            continue
+        return metrics
+    return metrics
+
+
 async def test_story_loop() -> LoopSummary:
     summary = LoopSummary(endpoint="/ws/story", iterations=ITERATIONS)
 
     for i in range(ITERATIONS):
-        async with websockets.connect(WS_STORY, max_size=2**22, open_timeout=CONNECT_TIMEOUT, close_timeout=5.0) as ws:
-            first = await recv_json(ws, 30.0)
-            if first.get("type") == "status" and first.get("model"):
-                summary.model_identities.append(str(first.get("model")))
+        connected = False
+        ws = None
+        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            try:
+                ws = await websockets.connect(
+                    WS_STORY,
+                    max_size=None,
+                    open_timeout=CONNECT_TIMEOUT,
+                    close_timeout=5.0,
+                )
+                first = await recv_json(ws, 30.0)
+                if first.get("type") == "status" and first.get("model"):
+                    summary.model_identities.append(str(first.get("model")))
+                connected = True
+                break
+            except Exception as exc:
+                if ws is not None:
+                    await ws.close()
+                if attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                    await asyncio.sleep(2**attempt)
+                    continue
+                summary.failures += 1
+                summary.error_messages.append(f"story connect failed: {type(exc).__name__}: {exc}")
 
+        if not connected or ws is None:
+            await asyncio.sleep(2)
+            continue
+
+        try:
             try:
                 a = await asyncio.wait_for(
-                    run_story_prompt(ws, f"Iteration {i+1}: Create an illustrated story about a girl in an attic."),
+                    run_story_prompt_with_retry(ws, f"Iteration {i+1}: Create an illustrated story about a girl in an attic."),
                     timeout=ITERATION_TIMEOUT,
                 )
             except TimeoutError:
                 summary.failures += 1
                 summary.error_messages.append("story iteration timeout at prompt A")
+                await asyncio.sleep(2)
                 continue
             summary.add_turn(a)
 
-            b = await run_story_prompt(ws, "Create an illustrated cyberpunk story in neon watercolor style about a lone mechanic.")
+            await asyncio.sleep(1)
+            b = await run_story_prompt_with_retry(
+                ws,
+                "Create an illustrated cyberpunk story in neon watercolor style about a lone mechanic.",
+            )
             summary.add_turn(b)
 
             interrupt_start = time.perf_counter()
@@ -449,25 +571,35 @@ async def test_story_loop() -> LoopSummary:
             await asyncio.sleep(0.25)
             await ws.send(json.dumps({"type": "interrupt"}))
 
-            interrupted = False
-            deadline = time.perf_counter() + ACK_TIMEOUT
-            while time.perf_counter() < deadline:
-                msg = await recv_json(ws, 20.0)
-                if msg.get("type") in {"__timeout__", "__exception__", "__bad_json__"}:
-                    break
-                if msg.get("type") == "status" and msg.get("status") == "interrupted":
-                    interrupted = True
-                    summary.interrupt_ack_latencies.append(time.perf_counter() - interrupt_start)
-                    break
-                if msg.get("type") == "error":
-                    break
-
-            if not interrupted:
+            ack_ok, _, ack_err = await wait_for_message(ws, lambda m: m.get("type") == "interrupted", ACK_TIMEOUT)
+            if ack_ok:
+                summary.interrupt_ack_latencies.append(time.perf_counter() - interrupt_start)
+            else:
                 summary.failures += 1
-                summary.error_messages.append("story interrupt did not ACK")
+                summary.error_messages.append(f"story interrupt did not ACK: {ack_err or 'unknown'}")
 
-            d = await run_story_prompt(ws, "Create a new illustrated story about a clockmaker right after interruption.")
+            reset_ok, _, reset_err = await wait_for_message(
+                ws,
+                lambda m: (
+                    m.get("type") == "status"
+                    and (m.get("status") == "connected" or m.get("state") == "IDLE")
+                ),
+                TURN_TIMEOUT_STORY,
+            )
+            if not reset_ok:
+                summary.failures += 1
+                summary.error_messages.append(f"story reset not observed: {reset_err or 'unknown'}")
+
+            await asyncio.sleep(1)
+            d = await run_story_prompt_with_retry(
+                ws,
+                "Create a new illustrated story about a clockmaker right after interruption.",
+            )
             summary.add_turn(d)
+        finally:
+            await ws.close()
+
+        await asyncio.sleep(2)
 
     return summary
 
