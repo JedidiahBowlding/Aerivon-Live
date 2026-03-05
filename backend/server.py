@@ -650,11 +650,14 @@ async def _annotate_screenshot(page, png_bytes: bytes) -> bytes:
 def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dict] | None = None) -> str:
     allowed = [
         "goto (url)",
-        "click (element_index)",
+        "click_index (element_index)",
+        "click_text (text)",
+        "click_selector (selector)",
         "type (text)",
         "press (key)",
         "scroll (delta_y)",
         "wait (ms)",
+        "extract (what)",
     ]
     context = "\n".join(memory[-12:]).strip()
     
@@ -715,7 +718,9 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
             "{\n"
             "  \"actions\": [\n"
             "    {\"type\": \"goto\", \"url\": \"https://...\"} |\n"
-            "    {\"type\": \"click\", \"element_index\": 0} |\n"
+            "    {\"type\": \"click_index\", \"element_index\": 0} |\n"
+            "    {\"type\": \"click_text\", \"text\": \"Learn More\"} |\n"
+            "    {\"type\": \"click_selector\", \"selector\": \"button[type='submit']\"} |\n"
             "    {\"type\": \"type\", \"text\": \"...\"} |\n"
             "    {\"type\": \"press\", \"key\": \"Enter\"} |\n"
             "    {\"type\": \"scroll\", \"delta_y\": 500} |\n"
@@ -726,7 +731,7 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
             "  \"note\": \"Describe executed action(s) only\"\n"
             "}\n\n"
             f"Allowed action types: {', '.join(allowed)}.\n"
-            "CRITICAL: For clicks, use 'element_index' (NOT x,y coordinates). Choose the index from the list below.\n"
+            "CRITICAL: Prefer click_index with 'element_index'. You may use click_text or click_selector when needed.\n"
             f"{elements_text}\n"
             "Rules: do not invent URLs; do not access localhost/private IPs/metadata.\n"
             "If the target element isn't visible, prefer scroll then another step.\n\n"
@@ -734,6 +739,55 @@ def _ui_action_prompt(task: str, memory: list[str], clickable_elements: list[dic
             f"{context}\n\n"
             f"User intent (do not change this goal): {task}\n"
         )
+
+
+def _normalize_ui_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize planner variants into executor-friendly action types."""
+    normalized = dict(action)
+    raw_type = normalized.get("type")
+    if raw_type is None:
+        raw_type = normalized.get("action")
+    t = str(raw_type or "").strip().lower().replace("-", "_")
+
+    aliases = {
+        "navigate": "goto",
+        "open": "goto",
+        "open_url": "goto",
+        "visit": "goto",
+        "go_to": "goto",
+        "enter_text": "type",
+        "input_text": "type",
+        "fill": "type",
+        "submit": "press",
+        "tap": "click",
+        "select": "click",
+    }
+    t = aliases.get(t, t)
+
+    if t == "press" and "key" not in normalized:
+        normalized["key"] = "Enter"
+
+    if t == "click":
+        if "selector" in normalized:
+            t = "click_selector"
+        elif "text" in normalized or "label" in normalized:
+            if "text" not in normalized and "label" in normalized:
+                normalized["text"] = normalized.get("label")
+            t = "click_text"
+        elif "element_index" in normalized or "index" in normalized:
+            if "element_index" not in normalized and "index" in normalized:
+                normalized["element_index"] = normalized.get("index")
+            t = "click_index"
+
+    if t == "click_by_text":
+        t = "click_text"
+    elif t == "click_by_selector":
+        t = "click_selector"
+    elif t == "click_by_index":
+        t = "click_index"
+
+    normalized["type"] = t
+    return normalized
 
 
 async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task: str, memory: list[str], page=None) -> dict[str, Any]:
@@ -763,17 +817,20 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
             "You are a browser automation planner.\n\n"
             "Return ONLY JSON.\n\n"
             "Allowed actions:\n"
-            "- navigate\n"
-            "- click\n"
+            "- goto\n"
+            "- click_index\n"
+            "- click_text\n"
+            "- click_selector\n"
             "- type\n"
+            "- press\n"
             "- scroll\n"
             "- wait\n"
             "- extract\n\n"
             "Example output:\n"
             "{\n"
             "  \"actions\": [\n"
-            "    {\"action\": \"navigate\", \"url\": \"https://example.com\"},\n"
-            "    {\"action\": \"click\", \"selector\": \"a[href*='domains']\"}\n"
+            "    {\"type\": \"goto\", \"url\": \"https://example.com\"},\n"
+            "    {\"type\": \"click_text\", \"text\": \"Domains\"}\n"
             "  ]\n"
             "}"
         ),
@@ -825,13 +882,7 @@ async def _ui_plan_actions(*, client: genai.Client, screenshot_png: bytes, task:
         for action in actions:
             if not isinstance(action, dict):
                 continue
-            action_copy = dict(action)
-            if "type" not in action_copy and "action" in action_copy:
-                action_copy["type"] = action_copy.get("action")
-            t = str(action_copy.get("type") or "").lower()
-            if t == "navigate":
-                action_copy["type"] = "goto"
-            normalized_actions.append(action_copy)
+            normalized_actions.append(_normalize_ui_action(action))
         result["actions"] = normalized_actions
 
     # Store clickable elements in result for click handler to use
@@ -868,40 +919,120 @@ async def handle_ui_request(
         if not is_safe_url(url):
             raise ValueError("Blocked unsafe URL")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(800)
+        await wait_for_page_ready()
+
+    async def wait_for_page_ready() -> None:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=7000)
+        except Exception:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+        await page.wait_for_timeout(200)
 
     async def execute_action(action: dict[str, Any], clickable_elements: list[dict] | None = None) -> dict[str, Any]:
         nonlocal page
         if context.get("cancel_flag"):
             return {"ok": False, "skipped": True, "reason": "cancelled"}
 
-        t = str(action.get("type") or "").strip().lower()
+        normalized_action = _normalize_ui_action(action)
+        t = str(normalized_action.get("type") or "").strip().lower()
         if t == "goto":
-            url = str(action.get("url") or "")
+            url = str(normalized_action.get("url") or "")
             await safe_goto(url)
             return {"ok": True, "type": "goto", "url": url}
+
+        if t == "click_index":
+            idx = int(normalized_action.get("element_index") or 0)
+            if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
+                return {"ok": False, "error": f"Invalid element_index: {idx}"}
+            el = clickable_elements[idx]
+            x, y = el['x'] + el['w'] // 2, el['y'] + el['h'] // 2
+            await page.mouse.click(x, y)
+            await wait_for_page_ready()
+            return {"ok": True, "type": "click_index", "element_index": idx, "x": x, "y": y}
+
+        if t == "click_text":
+            target_text = str(normalized_action.get("text") or "").strip()
+            if not target_text:
+                return {"ok": False, "error": "click_text requires non-empty 'text'"}
+            await page.get_by_text(target_text, exact=False).first.click(timeout=8000)
+            await wait_for_page_ready()
+            return {"ok": True, "type": "click_text", "text": target_text}
+
+        if t == "click_selector":
+            selector = str(normalized_action.get("selector") or "").strip()
+            if not selector:
+                return {"ok": False, "error": "click_selector requires non-empty 'selector'"}
+            await page.locator(selector).first.click(timeout=8000)
+            await wait_for_page_ready()
+            return {"ok": True, "type": "click_selector", "selector": selector}
+
         if t == "click":
-            if "element_index" in action:
-                idx = int(action.get("element_index") or 0)
+            if "element_index" in normalized_action:
+                idx = int(normalized_action.get("element_index") or 0)
                 if not clickable_elements or idx < 0 or idx >= len(clickable_elements):
                     return {"ok": False, "error": f"Invalid element_index: {idx}"}
                 el = clickable_elements[idx]
                 x, y = el['x'] + el['w'] // 2, el['y'] + el['h'] // 2
             else:
-                x, y = int(action.get("x") or 0), int(action.get("y") or 0)
-            
+                x, y = int(normalized_action.get("x") or 0), int(normalized_action.get("y") or 0)
+
             await page.mouse.click(x, y)
-            await page.wait_for_timeout(1000) # Wait for nav or SPA update
+            await wait_for_page_ready()
             return {"ok": True, "type": "click", "x": x, "y": y}
+
         if t == "type":
-            await page.keyboard.type(str(action.get("text") or ""))
+            input_text = str(normalized_action.get("text") or "")
+            selector = str(normalized_action.get("selector") or "").strip()
+            if selector:
+                await page.locator(selector).first.fill(input_text, timeout=8000)
+            else:
+                await page.keyboard.type(input_text)
             return {"ok": True, "type": "type"}
+
         if t == "press":
-            await page.keyboard.press(str(action.get("key") or "Enter"))
-            return {"ok": True, "type": "press"}
+            key = str(normalized_action.get("key") or "Enter")
+            await page.keyboard.press(key)
+            await wait_for_page_ready()
+            return {"ok": True, "type": "press", "key": key}
+
         if t == "scroll":
-            await page.mouse.wheel(0, int(action.get("delta_y") or 0))
+            delta_y = int(normalized_action.get("delta_y") or 0)
+            await page.mouse.wheel(0, delta_y)
+            await wait_for_page_ready()
             return {"ok": True, "type": "scroll"}
+
+        if t == "wait":
+            ms = max(0, min(15000, int(normalized_action.get("ms") or 0)))
+            await page.wait_for_timeout(ms)
+            return {"ok": True, "type": "wait", "ms": ms}
+
+        if t == "extract":
+            what = str(normalized_action.get("what") or "").strip()
+            extracted = await page.evaluate(
+                """(target) => {
+                    const title = document.title || '';
+                    const url = location.href;
+                    const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (!target) {
+                        return {title, url, text: bodyText.slice(0, 2000)};
+                    }
+                    const lowerBody = bodyText.toLowerCase();
+                    const lowerTarget = String(target).toLowerCase();
+                    const idx = lowerBody.indexOf(lowerTarget);
+                    if (idx < 0) {
+                        return {title, url, found: false, text: bodyText.slice(0, 2000)};
+                    }
+                    const start = Math.max(0, idx - 160);
+                    const end = Math.min(bodyText.length, idx + lowerTarget.length + 160);
+                    return {title, url, found: true, snippet: bodyText.slice(start, end)};
+                }""",
+                what,
+            )
+            return {"ok": True, "type": "extract", "what": what, "data": extracted}
+
         return {"ok": False, "error": f"unknown action: {t}"}
 
     # If text is a URL, navigate directly.
